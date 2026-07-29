@@ -4,7 +4,7 @@ Konzept
 -------
 * Ein angepinnter Hub-Post mit Buttons (Partner suchen / Mein Status / Hilfe).
 * Wer sucht, bekommt einen **öffentlichen Forum-Post** ("🔍 … sucht
-  Level-Partner") mit einem *Mit mir leveln*-Button — das Schwarze Brett.
+  Level-Partner") mit einem *Zusammen leveln*-Button — das Schwarze Brett.
 * Klickt jemand den Button, geht eine Anfrage an den Sucher; nimmt der an,
   entsteht ein **Team-Post** ("🤝 Team Phoenix"), beide werden hinzugefügt und
   die beiden Such-Posts verschwinden.
@@ -81,7 +81,7 @@ HUB_TEXT = (
     "**So geht's:**\n"
     "1. **Partner suchen** — Char (oder neu rollen) + Zeiten + Pensum wählen. "
     "Dein Suchpost erscheint hier im Forum.\n"
-    "2. Findest du unten jemand Passenden, klick **🤝 Mit mir leveln** in "
+    "2. Findest du unten jemand Passenden, klick **🤝 Zusammen leveln** in "
     "seinem Post.\n"
     "3. Nimmt er an, macht der Bot euch ein **Team** mit eigenem Thread — "
     "Termine, Screenshots, eure Reise.\n\n"
@@ -93,7 +93,7 @@ HUB_HELP_TEXT = (
     "jemandem zusammen frisch zu rollen), deine Spielzeiten und dein **Pensum** "
     "(1–2 h / 2–4 h / 5 h+). Optional: **Self-Found** & Vorlieben, plus eine "
     "kurze Notiz. Der Bot stellt dich aufs Board und pingt passende Sucher.\n\n"
-    "**Mit mir leveln** — in einem fremden Suchpost startest du damit eine "
+    "**Zusammen leveln** — in einem fremden Suchpost startest du damit eine "
     "Anfrage. Der andere muss zustimmen, dann entsteht euer Team.\n\n"
     "**Mein Status** — zeigt alle deine Teams und offenen Suchen. Pro Char "
     "geht ein Partner — du kannst also mit mehreren Twinks parallel suchen. "
@@ -311,7 +311,7 @@ class DuoCog(ManagedTaskCog):
         lines.append(f"• Gesucht von <@{signup.discord_user_id}>")
         lines.append("")
         lines.append(
-            "Passt zu dir? Klick **🤝 Mit mir leveln** — der Rest geht von allein."
+            "Passt zu dir? Klick **🤝 Zusammen leveln** — der Rest geht von allein."
         )
         return "\n".join(lines)
 
@@ -321,6 +321,40 @@ class DuoCog(ManagedTaskCog):
         classes = [c for c in classes if c]
         suffix = f" · {' + '.join(classes)}" if classes else ""
         return f"🤝 {name}{suffix}"[:100]
+
+    async def _team_embed(
+        self, name: str, members: list[tuple[int, str, str]]
+    ) -> discord.Embed:
+        """Live journey panel for a team post.
+
+        Rebuilt from the current snapshot so levels/classes stay up to date on
+        every refresh. ``members`` items are ``(user_id, char_key, char_name)``.
+        """
+        embed = discord.Embed(
+            title=f"🤝 {name}",
+            description=(
+                "Euer gemeinsamer Weg. Viel Erfolg — und passt aufeinander " "auf. 🪷"
+            ),
+            colour=HORDE_RED,
+        )
+        levels: list[int] = []
+        for idx, (user_id, char_key, char_name) in enumerate(members, start=1):
+            descriptor = await self._char_descriptor(char_key, char_name)
+            embed.add_field(
+                name=f"Partner {idx}",
+                value=f"<@{user_id}>\n{descriptor}",
+                inline=True,
+            )
+            levels.append(await self._char_level(char_key))
+        reached = [lvl for lvl in levels if lvl > 0]
+        if reached:
+            embed.add_field(
+                name="Gemeinsam",
+                value="Level " + " + ".join(str(lvl) for lvl in reached),
+                inline=False,
+            )
+        embed.set_footer(text="Level & Klasse aktualisieren sich automatisch.")
+        return embed
 
     async def _chars_in_active_team(self, user_id: int) -> set[str]:
         """Character keys of the user that already sit in an active team."""
@@ -704,47 +738,18 @@ class DuoCog(ManagedTaskCog):
             req_signup = await self.data.get_signup(requester_char_key)
 
         name = pick_team_name(await self.data.used_team_names())
-        owner_line = await self._char_descriptor(owner_char_key, owner_char_name)
-        req_line = await self._char_descriptor(requester_char_key, requester_char_name)
-        shared = overlap_keys(
-            decode_windows(owner_signup.time_windows) if owner_signup else [],
-            decode_windows(req_signup.time_windows) if req_signup else [],
-        )
-        embed = discord.Embed(
-            title=f"🤝 {name}",
-            description=(
-                "Euer gemeinsamer Weg beginnt. Viel Erfolg — und passt "
-                "aufeinander auf. 🪷"
-            ),
-            colour=HORDE_RED,
-        )
-        embed.add_field(
-            name="Partner 1", value=f"<@{owner_id}>\n{owner_line}", inline=True
-        )
-        embed.add_field(
-            name="Partner 2", value=f"<@{requester_id}>\n{req_line}", inline=True
-        )
-        if shared:
-            embed.add_field(
-                name="Gemeinsame Zeiten", value=format_windows(shared), inline=False
-            )
-        embed.set_footer(text="Meilensteine & Reise werden hier automatisch geteilt.")
-
+        members = [
+            (owner_id, owner_char_key, owner_char_name),
+            (requester_id, requester_char_key, requester_char_name),
+        ]
         created = await forum.create_thread(
             name=await self._team_title(name, [owner_char_key, requester_char_key]),
-            embed=embed,
+            embed=await self._team_embed(name, members),
             applied_tags=self._tag(TAG_ACTIVE),
         )
         await created.message.edit(view=DuoTeamPostView(self))
         thread = created.thread
-        await self.data.create_team(
-            name,
-            thread.id,
-            [
-                (owner_id, owner_char_key, owner_char_name),
-                (requester_id, requester_char_key, requester_char_name),
-            ],
-        )
+        await self.data.create_team(name, thread.id, members)
         for user_id in (owner_id, requester_id):
             try:
                 await thread.add_user(discord.Object(id=user_id))
@@ -959,7 +964,7 @@ class DuoCog(ManagedTaskCog):
         for step in (
             self._expire_stale_searches,
             self._refresh_search_posts,
-            self._refresh_team_titles,
+            self._refresh_team_posts,
             self._refresh_hub_counter,
         ):
             try:
@@ -996,19 +1001,27 @@ class DuoCog(ManagedTaskCog):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    async def _refresh_team_titles(self) -> None:
+    async def _refresh_team_posts(self) -> None:
+        """Keep team posts' embed (live levels/classes) and title current."""
         for team in await self.data.active_teams():
             if not team.thread_id:
                 continue
-            members = await self.data.team_members(team.team_id)
-            title = await self._team_title(
-                team.name, [m.character_key for m in members]
-            )
             thread = await self._fetch_thread(team.thread_id)
-            if thread is None or thread.name == title:
+            if thread is None:
                 continue
+            members = await self.data.team_members(team.team_id)
+            member_tuples = [
+                (m.discord_user_id, m.character_key, m.character_name) for m in members
+            ]
             try:
-                await thread.edit(name=title)
+                await thread.get_partial_message(team.thread_id).edit(
+                    embed=await self._team_embed(team.name, member_tuples)
+                )
+                title = await self._team_title(
+                    team.name, [m.character_key for m in members]
+                )
+                if thread.name != title:  # rename only on change (rate-limit)
+                    await thread.edit(name=title)
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
@@ -1237,14 +1250,14 @@ class DuoHubView(discord.ui.View):
 
 
 class DuoSearchPostView(discord.ui.View):
-    """Persistent 'Mit mir leveln' button on a public search post."""
+    """Persistent 'Zusammen leveln' button on a public search post."""
 
     def __init__(self, cog: DuoCog) -> None:
         super().__init__(timeout=None)
         self.cog = cog
 
     @discord.ui.button(
-        label="Mit mir leveln",
+        label="Zusammen leveln",
         style=discord.ButtonStyle.success,
         emoji="🤝",
         custom_id="duo_post:join",

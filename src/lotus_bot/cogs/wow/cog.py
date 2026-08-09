@@ -331,16 +331,18 @@ class SyncReport:
       (confirmed yet never promoted; must NOT be kicked).
     * ``unclaimed_ranked`` — char on Twink rank or higher (rank <= TWINK_RANK)
       with no claim at all. Policy: Twink+ must be claimed, so these should be
-      claimed or demoted. Registered guild-bank chars are excluded.
-    * ``unclaimed_initiates`` — Initiate-rank chars with no claim. At the player
-      cap these are the safe kick candidates. Guild-bank chars excluded.
+      claimed or demoted. Registered guild-bank chars are excluded. Initiates
+      are deliberately NOT listed — they are new/probation and must not be
+      surfaced as kick candidates.
+    * ``claims_left_discord`` — verified claim on a Member+ char whose claiming
+      Discord user has left the server. Officer demotes the char in-game.
     * ``multi_member_users`` — ``(discord_user_id, [(claim, member), ...])`` for
       users with more than one Member+ char (invariant: only one allowed).
     """
 
     initiate_claims: list[tuple["CharacterClaim", RosterMember]]
     unclaimed_ranked: list[RosterMember]
-    unclaimed_initiates: list[RosterMember]
+    claims_left_discord: list[tuple["CharacterClaim", RosterMember]]
     multi_member_users: list[tuple[int, list[tuple["CharacterClaim", RosterMember]]]]
 
     @property
@@ -348,7 +350,7 @@ class SyncReport:
         return not (
             self.initiate_claims
             or self.unclaimed_ranked
-            or self.unclaimed_initiates
+            or self.claims_left_discord
             or self.multi_member_users
         )
 
@@ -1164,6 +1166,29 @@ class WoWCog(ManagedTaskCog):
             return "kein Rang"
         return GUILD_RANKS.get(rank, f"Rang {rank}")
 
+    def _main_guild(self) -> "discord.Guild | None":
+        guild = getattr(self.bot, "main_guild", None)
+        return guild if isinstance(guild, discord.Guild) else None
+
+    async def _discord_member_present(
+        self, guild: "discord.Guild", user_id: int
+    ) -> bool:
+        """Whether ``user_id`` is still a member of the Discord guild.
+
+        Only returns ``False`` on a confirmed 404 (member left). Cache misses
+        are double-checked via ``fetch_member``; any other error is treated as
+        "present" so a transient hiccup never wrongly flags someone as gone.
+        """
+        if guild.get_member(user_id) is not None:
+            return True
+        try:
+            await guild.fetch_member(user_id)
+            return True
+        except discord.NotFound:
+            return False
+        except discord.HTTPException:
+            return True
+
     async def build_sync_report(self, members: list[RosterMember]) -> SyncReport:
         """Compare verified claims against in-game ranks (see :class:`SyncReport`).
 
@@ -1177,7 +1202,12 @@ class WoWCog(ManagedTaskCog):
         # never flag them for "claim or kick".
         bank_keys = {b.character_key for b in await self.data.list_bank_characters()}
 
+        guild = self._main_guild()
+        # Cache Discord-presence per user across all their claims.
+        presence: dict[int, bool] = {}
+
         initiate_claims: list[tuple[CharacterClaim, RosterMember]] = []
+        claims_left_discord: list[tuple[CharacterClaim, RosterMember]] = []
         member_claims_by_user: dict[int, list[tuple[CharacterClaim, RosterMember]]] = {}
         for claim in verified:
             member = members_by_key.get(claim.character_key)
@@ -1185,6 +1215,15 @@ class WoWCog(ManagedTaskCog):
                 continue
             if member.guild_rank == INITIATE_RANK:
                 initiate_claims.append((claim, member))
+            # Member+ char whose claiming Discord user has left the server →
+            # officer demotes it in-game. Skipped entirely without a guild.
+            if guild is not None and member.guild_rank <= MEMBER_RANK:
+                if claim.discord_user_id not in presence:
+                    presence[claim.discord_user_id] = (
+                        await self._discord_member_present(guild, claim.discord_user_id)
+                    )
+                if not presence[claim.discord_user_id]:
+                    claims_left_discord.append((claim, member))
             if member.guild_rank <= MEMBER_RANK:
                 member_claims_by_user.setdefault(claim.discord_user_id, []).append(
                     (claim, member)
@@ -1198,13 +1237,6 @@ class WoWCog(ManagedTaskCog):
             and member.character_key not in claimed_keys
             and member.character_key not in bank_keys
         ]
-        unclaimed_initiates = [
-            member
-            for member in members_by_key.values()
-            if member.guild_rank == INITIATE_RANK
-            and member.character_key not in claimed_keys
-            and member.character_key not in bank_keys
-        ]
         multi_member_users = [
             (user_id, claims)
             for user_id, claims in member_claims_by_user.items()
@@ -1213,12 +1245,12 @@ class WoWCog(ManagedTaskCog):
 
         initiate_claims.sort(key=lambda pair: pair[0].character_name.casefold())
         unclaimed_ranked.sort(key=lambda m: (m.guild_rank, m.name.casefold()))
-        unclaimed_initiates.sort(key=lambda m: m.name.casefold())
+        claims_left_discord.sort(key=lambda pair: (pair[1].guild_rank, pair[1].name))
         multi_member_users.sort(key=lambda pair: pair[0])
         return SyncReport(
             initiate_claims=initiate_claims,
             unclaimed_ranked=unclaimed_ranked,
-            unclaimed_initiates=unclaimed_initiates,
+            claims_left_discord=claims_left_discord,
             multi_member_users=multi_member_users,
         )
 
@@ -1239,17 +1271,6 @@ class WoWCog(ManagedTaskCog):
                     body,
                 )
             )
-        if report.unclaimed_initiates:
-            body = [
-                f"- **{member.name}** (Level {member.level})"
-                for member in report.unclaimed_initiates
-            ]
-            sections.append(
-                (
-                    "🚫 **Initiate ohne Claim** — können gekickt werden:",
-                    body,
-                )
-            )
         if report.unclaimed_ranked:
             body = [
                 f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
@@ -1260,6 +1281,19 @@ class WoWCog(ManagedTaskCog):
                 (
                     "**Twink+ ohne Claim** — claimen lassen oder auf Initiate "
                     "runterstufen:",
+                    body,
+                )
+            )
+        if report.claims_left_discord:
+            body = [
+                f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
+                f"Level {member.level}) — Claim: <@{claim.discord_user_id}>"
+                for claim, member in report.claims_left_discord
+            ]
+            sections.append(
+                (
+                    "🚪 **Owner hat Discord verlassen** — Char in-game "
+                    "runterstufen (Claim entzogen sich selbst):",
                     body,
                 )
             )

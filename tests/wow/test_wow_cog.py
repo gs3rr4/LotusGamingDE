@@ -3436,13 +3436,12 @@ async def test_sync_report_flags_all_categories(tmp_path, patch_logged_task):
     assert posted >= 1
     msg = "\n".join(sent[0] for sent in officer.sent)
     assert "Offi-Sync-Report" in msg
-    # Claimed-but-Initiate → promote, explicitly NOT a kick candidate.
+    # Claimed-but-Initiate → promote reminder (explicitly NOT a kick candidate).
     assert "Neulor" in msg and "<@200>" in msg
-    # Initiate without any claim → kick list.
-    assert "Kickmich" in msg
-    # A pending (unverified) claim protects an Initiate from the kick list.
+    # Initiates are new/probation and must NEVER be listed for kicking.
+    assert "Kickmich" not in msg
     assert "Pendlor" not in msg
-    # Twink+ without claim now includes Bank rank (Bankus) and Member (Altmember).
+    # Twink+ without claim includes Bank rank (Bankus) and Member (Altmember).
     assert "Altmember" in msg
     assert "Bankus" in msg
     # Registered guild-bank char is never flagged.
@@ -3472,6 +3471,57 @@ async def test_sync_report_empty_when_everything_matches(tmp_path, patch_logged_
     assert await cog.sync_report_chunks([main, twink, bank]) == []
     assert await cog._post_sync_report([main, twink, bank]) == 0
     assert officer.sent == []
+
+
+@pytest.mark.asyncio
+async def test_sync_report_flags_owner_who_left_discord(
+    tmp_path, patch_logged_task, monkeypatch
+):
+    monkeypatch.setattr(wow_cog_mod.discord, "Guild", FakeGuild)
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    stays = ranked("id:1", "Bleibtchar", 3)  # Member, owner 100 still on Discord
+    left = ranked("id:2", "Wegchar", 3)  # Member, owner 500 left Discord
+    await cog.data.replace_snapshot([stays, left])
+    await _verify(cog, stays, 100)
+    await _verify(cog, left, 500)
+
+    role = FakeRole(wow_cog_mod.GUILD_ROLE_ID)
+    # Only 100 is in the guild; 500 has left → fetch_member(500) raises NotFound.
+    cog.bot.main_guild = FakeGuild(role, [FakeMember(100)])
+
+    posted = await cog._post_sync_report([stays, left])
+
+    assert posted >= 1
+    msg = "\n".join(sent[0] for sent in officer.sent)
+    assert "Discord verlassen" in msg
+    assert "Wegchar" in msg and "<@500>" in msg
+    # The char whose owner is still around must not be flagged.
+    assert "Bleibtchar" not in msg
+
+
+@pytest.mark.asyncio
+async def test_sync_report_no_guild_skips_left_discord_check(
+    tmp_path, patch_logged_task
+):
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    # No main_guild resolvable → the left-Discord check is skipped, not a crash.
+    solo = ranked("id:1", "Soloist", 3)
+    await cog.data.replace_snapshot([solo])
+    await _verify(cog, solo, 100)
+
+    assert await cog.sync_report_chunks([solo]) == []
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,9 @@ GUILD_RANKS = {
     6: "Initiate",
 }
 MEMBER_RANK = 3
+# Everyone at Twink rank or higher (rank <= TWINK_RANK) is expected to have a
+# char claim; only Initiate (below Twink) is the unclaimed "probation" tier.
+TWINK_RANK = 5
 INITIATE_RANK = 6
 try:
     DIGEST_TIMEZONE = ZoneInfo("Europe/Berlin")
@@ -325,22 +328,27 @@ class SyncReport:
     """Discrepancies between verified claims and in-game guild ranks.
 
     * ``initiate_claims`` — verified claim, but the char still sits on Initiate
-      (confirmed yet never promoted).
-    * ``members_without_claim`` — char on Member+ rank with no claim at all
-      (legacy Discord-join members).
+      (confirmed yet never promoted; must NOT be kicked).
+    * ``unclaimed_ranked`` — char on Twink rank or higher (rank <= TWINK_RANK)
+      with no claim at all. Policy: Twink+ must be claimed, so these should be
+      claimed or demoted. Registered guild-bank chars are excluded.
+    * ``unclaimed_initiates`` — Initiate-rank chars with no claim. At the player
+      cap these are the safe kick candidates. Guild-bank chars excluded.
     * ``multi_member_users`` — ``(discord_user_id, [(claim, member), ...])`` for
       users with more than one Member+ char (invariant: only one allowed).
     """
 
     initiate_claims: list[tuple["CharacterClaim", RosterMember]]
-    members_without_claim: list[RosterMember]
+    unclaimed_ranked: list[RosterMember]
+    unclaimed_initiates: list[RosterMember]
     multi_member_users: list[tuple[int, list[tuple["CharacterClaim", RosterMember]]]]
 
     @property
     def empty(self) -> bool:
         return not (
             self.initiate_claims
-            or self.members_without_claim
+            or self.unclaimed_ranked
+            or self.unclaimed_initiates
             or self.multi_member_users
         )
 
@@ -1165,6 +1173,9 @@ class WoWCog(ManagedTaskCog):
         members_by_key = {m.character_key: m for m in members if not m.is_ghost}
         verified = await self.data.list_claims("verified")
         claimed_keys = {c.character_key for c in await self.data.list_claims("all")}
+        # Registered guild-bank chars are shared and intentionally unclaimed —
+        # never flag them for "claim or kick".
+        bank_keys = {b.character_key for b in await self.data.list_bank_characters()}
 
         initiate_claims: list[tuple[CharacterClaim, RosterMember]] = []
         member_claims_by_user: dict[int, list[tuple[CharacterClaim, RosterMember]]] = {}
@@ -1179,12 +1190,20 @@ class WoWCog(ManagedTaskCog):
                     (claim, member)
                 )
 
-        members_without_claim = [
+        unclaimed_ranked = [
             member
             for member in members_by_key.values()
             if member.guild_rank is not None
-            and member.guild_rank <= MEMBER_RANK
+            and member.guild_rank <= TWINK_RANK
             and member.character_key not in claimed_keys
+            and member.character_key not in bank_keys
+        ]
+        unclaimed_initiates = [
+            member
+            for member in members_by_key.values()
+            if member.guild_rank == INITIATE_RANK
+            and member.character_key not in claimed_keys
+            and member.character_key not in bank_keys
         ]
         multi_member_users = [
             (user_id, claims)
@@ -1193,11 +1212,13 @@ class WoWCog(ManagedTaskCog):
         ]
 
         initiate_claims.sort(key=lambda pair: pair[0].character_name.casefold())
-        members_without_claim.sort(key=lambda m: (m.guild_rank, m.name.casefold()))
+        unclaimed_ranked.sort(key=lambda m: (m.guild_rank, m.name.casefold()))
+        unclaimed_initiates.sort(key=lambda m: m.name.casefold())
         multi_member_users.sort(key=lambda pair: pair[0])
         return SyncReport(
             initiate_claims=initiate_claims,
-            members_without_claim=members_without_claim,
+            unclaimed_ranked=unclaimed_ranked,
+            unclaimed_initiates=unclaimed_initiates,
             multi_member_users=multi_member_users,
         )
 
@@ -1214,19 +1235,31 @@ class WoWCog(ManagedTaskCog):
             sections.append(
                 (
                     "**Geclaimt & bestätigt, aber noch auf Initiate** — "
-                    "auf Member oder Twink hochstufen:",
+                    "auf Twink/Member hochstufen (NICHT kicken!):",
                     body,
                 )
             )
-        if report.members_without_claim:
+        if report.unclaimed_initiates:
             body = [
-                f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
-                f"Level {member.level})"
-                for member in report.members_without_claim
+                f"- **{member.name}** (Level {member.level})"
+                for member in report.unclaimed_initiates
             ]
             sections.append(
                 (
-                    "**Member+ ohne Claim** — claimen lassen oder runterstufen:",
+                    "🚫 **Initiate ohne Claim** — können gekickt werden:",
+                    body,
+                )
+            )
+        if report.unclaimed_ranked:
+            body = [
+                f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
+                f"Level {member.level})"
+                for member in report.unclaimed_ranked
+            ]
+            sections.append(
+                (
+                    "**Twink+ ohne Claim** — claimen lassen oder auf Initiate "
+                    "runterstufen:",
                     body,
                 )
             )
@@ -1998,10 +2031,24 @@ class WoWCog(ManagedTaskCog):
         gear = await self.data.gear_snapshot(member.character_key)
         professions = await self.data.professions_for_character(member.character_key)
 
-        twins: list[CharacterClaim] = []
+        twins: list[tuple[CharacterClaim, RosterMember | None]] = []
         if claim is not None:
             all_claims = await self.data.claims_for_user(claim.discord_user_id)
-            twins = [c for c in all_claims if c.character_key != claim.character_key]
+            snapshot = await self.data.get_snapshot()
+            others = [c for c in all_claims if c.character_key != claim.character_key]
+            twins = [(c, snapshot.get(c.character_key)) for c in others]
+            # Sort main-first: best in-game rank, then highest level.
+            twins.sort(
+                key=lambda pair: (
+                    (
+                        pair[1].guild_rank
+                        if pair[1] is not None and pair[1].guild_rank is not None
+                        else 99
+                    ),
+                    -(pair[1].level if pair[1] is not None else 0),
+                    pair[0].character_name.casefold(),
+                )
+            )
 
         viewer_is_owner = claim is not None and claim.discord_user_id == viewer_id
         return _WhoisLayoutView(
@@ -4158,16 +4205,34 @@ class PanelSearchSubView(discord.ui.View):
 
 
 async def _render_member_claims(cog: WoWCog, user_id: int, display_name: str) -> str:
-    """Render the claimed chars of a Discord user as a message body."""
+    """Render the claimed chars of a Discord user, main-first with rank+level."""
     claims = await cog.data.claims_for_user(user_id)
     if not claims:
         return f"**{display_name}** hat keine Chars geclaimt."
-    lines = [f"**Chars von {display_name}:**"]
-    for claim in claims:
-        roster = await cog.data.find_roster_member_by_name(claim.character_name)
+    snapshot = await cog.data.get_snapshot()
+    enriched = [(c, snapshot.get(c.character_key)) for c in claims]
+    # Best in-game rank first, then highest level → likely the main on top.
+    enriched.sort(
+        key=lambda pair: (
+            (
+                pair[1].guild_rank
+                if pair[1] is not None and pair[1].guild_rank is not None
+                else 99
+            ),
+            -(pair[1].level if pair[1] is not None else 0),
+            pair[0].character_name.casefold(),
+        )
+    )
+    lines = [f"**Chars von {display_name}** (nach Rang sortiert):"]
+    for claim, roster in enriched:
         status = "bestätigt" if claim.status == "verified" else "ungeprüft"
         if roster is not None:
-            lines.append(f"- {cog._format_roster_line(roster)} ({status})")
+            rank = cog._rank_label(roster.guild_rank)
+            ghost = " 🕯️" if roster.is_ghost else ""
+            lines.append(
+                f"- {cog._format_roster_line(roster)} — "
+                f"**{rank}**{ghost} ({status})"
+            )
         else:
             lines.append(
                 f"- **{claim.character_name}** ({status}, nicht mehr im Roster)"
@@ -4318,7 +4383,7 @@ class _WhoisLayoutView(discord.ui.LayoutView):
         claim: "CharacterClaim | None",
         gear,
         professions: list[CharacterProfession],
-        twins: list["CharacterClaim"],
+        twins: list[tuple["CharacterClaim", "RosterMember | None"]],
         viewer_id: int,
         viewer_is_owner: bool,
     ) -> None:
@@ -4339,9 +4404,10 @@ class _WhoisLayoutView(discord.ui.LayoutView):
         owner_str = f"<@{claim.discord_user_id}>" if claim else "_Nicht geclaimed_"
         status_str = "🕯️ Tot (Geist)" if member.is_ghost else "🟢 Lebt"
         ilvl_str = cog._format_item_level(gear.average_item_level) if gear else "—"
+        rank_str = cog._rank_label(member.guild_rank)
         info_line = (
-            f"**Owner:** {owner_str}  ·  **Status:** {status_str}  ·  "
-            f"**Ø iLvl:** {ilvl_str}"
+            f"**Owner:** {owner_str}  ·  **Rang:** {rank_str}  ·  "
+            f"**Status:** {status_str}  ·  **Ø iLvl:** {ilvl_str}"
         )
 
         items: list[discord.ui.Item] = [
@@ -4373,10 +4439,20 @@ class _WhoisLayoutView(discord.ui.LayoutView):
         if twins:
             items.append(discord.ui.Separator())
             owner_mention = f"<@{claim.discord_user_id}>"
-            twin_header = f"**Andere Chars von {owner_mention}:**"
+            lines = [f"**Andere Chars von {owner_mention}** (nach Rang sortiert):"]
+            for tclaim, tmember in twins:
+                if tmember is not None:
+                    detail = (
+                        f"{cog._rank_label(tmember.guild_rank)}, Level {tmember.level}"
+                    )
+                    ghost = " 🕯️" if tmember.is_ghost else ""
+                else:
+                    detail = "nicht mehr im Roster"
+                    ghost = ""
+                lines.append(f"- **{tclaim.character_name}** — {detail}{ghost}")
             if len(twins) > 5:
-                twin_header += f"  _(5 von {len(twins)})_"
-            items.append(discord.ui.TextDisplay(twin_header))
+                lines.append(f"_(Buttons unten: erste 5 von {len(twins)})_")
+            items.append(discord.ui.TextDisplay("\n".join(lines)))
 
         self.add_item(discord.ui.Container(*items))
 
@@ -4385,12 +4461,12 @@ class _WhoisLayoutView(discord.ui.LayoutView):
         # must be wrapped in an ActionRow.
         if twins:
             twin_row = discord.ui.ActionRow()
-            for twin in twins[:5]:
+            for tclaim, _tmember in twins[:5]:
                 twin_btn = discord.ui.Button(
-                    label=twin.character_name[:80],
+                    label=tclaim.character_name[:80],
                     style=discord.ButtonStyle.secondary,
                 )
-                twin_btn.callback = self._make_twin_callback(twin.character_name)
+                twin_btn.callback = self._make_twin_callback(tclaim.character_name)
                 twin_row.add_item(twin_btn)
             self.add_item(twin_row)
 

@@ -456,6 +456,25 @@ async def test_member_search_single_match_lists_claims(tmp_path, patch_logged_ta
 
 
 @pytest.mark.asyncio
+async def test_member_claims_shows_rank_and_sorts_main_first(
+    tmp_path, patch_logged_task
+):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    main = ranked("id:1", "Mainchar", 3, level=60)  # Member
+    twink = ranked("id:2", "Twinkerl", 5, level=41)  # Twink
+    await cog.data.replace_snapshot([main, twink])
+    await cog.data.create_claim(main, 99)
+    await cog.data.create_claim(twink, 99)
+
+    content = await wow_cog_mod._render_member_claims(cog, 99, "Gerrit")
+
+    assert "Member" in content and "Twink" in content
+    assert "Level **60**" in content and "Level **41**" in content
+    # Better in-game rank (Member) is listed above the Twink → likely the main.
+    assert content.index("Mainchar") < content.index("Twinkerl")
+
+
+@pytest.mark.asyncio
 async def test_member_search_no_match(tmp_path, patch_logged_task):
     cog = await create_cog(tmp_path, patch_logged_task)
     modal = wow_cog_mod.PanelMemberSearchModal(cog)
@@ -3376,7 +3395,7 @@ async def _verify(cog, char, uid):
 
 
 @pytest.mark.asyncio
-async def test_sync_report_flags_all_three_categories(tmp_path, patch_logged_task):
+async def test_sync_report_flags_all_categories(tmp_path, patch_logged_task):
     officer = DummyChannel()
     bot = MultiChannelBot(public_channel=None, officer_channel=officer)
     patch_logged_task(wow_cog_mod, log_setup)
@@ -3388,9 +3407,11 @@ async def test_sync_report_flags_all_three_categories(tmp_path, patch_logged_tas
     main_a2 = ranked("id:2", "Zweitmain", 2)  # Veteran, verified (100 → 2nd Member+)
     initiate_claimed = ranked("id:3", "Neulor", 6)  # verified but still Initiate
     twink = ranked("id:4", "Twinkus", 5)  # verified twink → fine
-    pending = ranked("id:5", "Pendlor", 6)  # UNVERIFIED claim → must be ignored
-    legacy_member = ranked("id:6", "Altmember", 3)  # Member, no claim at all
-    bank_noclaim = ranked("id:7", "Bankus", 4)  # Bank, no claim → not Member+
+    pending = ranked("id:5", "Pendlor", 6)  # UNVERIFIED claim → protected from kick
+    legacy_member = ranked("id:6", "Altmember", 3)  # Member, no claim
+    bank_noclaim = ranked("id:7", "Bankus", 4)  # Bank rank, no claim → Twink+ section
+    gbank = ranked("id:8", "Tresor", 4)  # Bank rank, registered gbank → excluded
+    kickable = ranked("id:9", "Kickmich", 6)  # Initiate, no claim → kick list
     roster = [
         main_a,
         main_a2,
@@ -3399,26 +3420,34 @@ async def test_sync_report_flags_all_three_categories(tmp_path, patch_logged_tas
         pending,
         legacy_member,
         bank_noclaim,
+        gbank,
+        kickable,
     ]
     await cog.data.replace_snapshot(roster)
     await _verify(cog, main_a, 100)
     await _verify(cog, main_a2, 100)
     await _verify(cog, initiate_claimed, 200)
     await _verify(cog, twink, 200)
-    await cog.data.create_claim(pending, 300)  # left unverified
+    await cog.data.create_claim(pending, 300)  # left unverified → still "claimed"
+    await cog.data.add_bank_character(gbank.character_key, gbank.name, 999)
 
     posted = await cog._post_sync_report(roster)
 
     assert posted >= 1
     msg = "\n".join(sent[0] for sent in officer.sent)
     assert "Offi-Sync-Report" in msg
-    # Section 1: verified claim on Initiate.
+    # Claimed-but-Initiate → promote, explicitly NOT a kick candidate.
     assert "Neulor" in msg and "<@200>" in msg
-    assert "Pendlor" not in msg  # unverified → ignored
-    # Section 2: Member+ without any claim; Bank char must not appear.
+    # Initiate without any claim → kick list.
+    assert "Kickmich" in msg
+    # A pending (unverified) claim protects an Initiate from the kick list.
+    assert "Pendlor" not in msg
+    # Twink+ without claim now includes Bank rank (Bankus) and Member (Altmember).
     assert "Altmember" in msg
-    assert "Bankus" not in msg
-    # Section 3: user with >1 Member+ char.
+    assert "Bankus" in msg
+    # Registered guild-bank char is never flagged.
+    assert "Tresor" not in msg
+    # >1 Member+ per user.
     assert "<@100>" in msg
     assert "Maina" in msg and "Zweitmain" in msg
 
@@ -3434,10 +3463,11 @@ async def test_sync_report_empty_when_everything_matches(tmp_path, patch_logged_
 
     main = ranked("id:1", "Main", 3)  # Member, verified
     twink = ranked("id:2", "Twink", 5)  # Twink, verified (same user, fine)
-    bank = ranked("id:3", "Bank", 4)  # Bank, no claim → not Member+
+    bank = ranked("id:3", "Bank", 4)  # Bank rank, registered gbank → excluded
     await cog.data.replace_snapshot([main, twink, bank])
     await _verify(cog, main, 100)
     await _verify(cog, twink, 100)
+    await cog.data.add_bank_character(bank.character_key, bank.name, 999)
 
     assert await cog.sync_report_chunks([main, twink, bank]) == []
     assert await cog._post_sync_report([main, twink, bank]) == 0

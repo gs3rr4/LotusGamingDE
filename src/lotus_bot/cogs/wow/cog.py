@@ -65,6 +65,7 @@ GUILD_RANKS = {
     6: "Initiate",
 }
 MEMBER_RANK = 3
+BANK_RANK = 4
 # Everyone at Twink rank or higher (rank <= TWINK_RANK) is expected to have a
 # char claim; only Initiate (below Twink) is the unclaimed "probation" tier.
 TWINK_RANK = 5
@@ -334,15 +335,21 @@ class SyncReport:
       claimed or demoted. Registered guild-bank chars are excluded. Initiates
       are deliberately NOT listed — they are new/probation and must not be
       surfaced as kick candidates.
-    * ``claims_left_discord`` — verified claim on a Member+ char whose claiming
-      Discord user has left the server. Officer demotes the char in-game.
+    * ``no_main_users`` — ``(discord_user_id, [member, ...])`` for users who own
+      a Twink/Bank char but NO Member+ main (e.g. their main died). The highest
+      remaining char should be promoted. Initiate-only owners are not flagged.
     * ``multi_member_users`` — ``(discord_user_id, [(claim, member), ...])`` for
       users with more than one Member+ char (invariant: only one allowed).
+
+    Note: claims whose Discord owner has left the server are pruned
+    automatically (see :meth:`WoWCog.prune_departed_claims`), so they never
+    reach this report — the now-ownerless char simply shows up under
+    ``unclaimed_ranked`` if it is Twink+.
     """
 
     initiate_claims: list[tuple["CharacterClaim", RosterMember]]
     unclaimed_ranked: list[RosterMember]
-    claims_left_discord: list[tuple["CharacterClaim", RosterMember]]
+    no_main_users: list[tuple[int, list[RosterMember]]]
     multi_member_users: list[tuple[int, list[tuple["CharacterClaim", RosterMember]]]]
 
     @property
@@ -350,7 +357,7 @@ class SyncReport:
         return not (
             self.initiate_claims
             or self.unclaimed_ranked
-            or self.claims_left_discord
+            or self.no_main_users
             or self.multi_member_users
         )
 
@@ -411,6 +418,7 @@ class WoWCog(ManagedTaskCog):
             await asyncio.sleep(self.roster_refresh_interval)
             try:
                 await self.refresh_live_roster()
+                await self.prune_departed_claims()
                 await self.sync_guild_role()
                 await self._notify_duo_refresh()
             except asyncio.CancelledError:
@@ -1189,6 +1197,98 @@ class WoWCog(ManagedTaskCog):
         except discord.HTTPException:
             return True
 
+    async def _remove_user_claims(self, user_id: int) -> list[CharacterClaim]:
+        """Delete all of a user's char claims; return what was removed."""
+        claims = await self.data.claims_for_user(user_id)
+        for claim in claims:
+            await self.data.remove_claim(claim.character_key)
+        if claims:
+            # Best-effort role cleanup; a no-op if the user is already gone.
+            await self.reconcile_guild_role_for(user_id)
+        return claims
+
+    async def prune_departed_claims(self) -> int:
+        """Drop claims whose Discord owner has left the server (self-healing).
+
+        Runs on the hourly reconcile and catches anyone who left while the bot
+        was offline (``on_member_remove`` handles the live case). A departed
+        user's claim is meaningless — removing it lets the now-ownerless char
+        surface as unclaimed instead of forever showing ``@unknown-user``.
+        Officers get a one-time note so they can demote the freed chars in-game.
+        """
+        guild = self._main_guild()
+        if guild is None:
+            return 0
+        by_user: dict[int, list[CharacterClaim]] = {}
+        for claim in await self.data.list_claims("all"):
+            by_user.setdefault(claim.discord_user_id, []).append(claim)
+
+        removed: list[tuple[int, list[CharacterClaim]]] = []
+        for user_id, user_claims in by_user.items():
+            if await self._discord_member_present(guild, user_id):
+                continue
+            await self._remove_user_claims(user_id)
+            removed.append((user_id, user_claims))
+
+        if not removed:
+            return 0
+        total = sum(len(claims) for _, claims in removed)
+        logger.info("[WoWCog] Pruned %d claim(s) from departed Discord users.", total)
+        await self._post_departed_claims_note(removed)
+        return total
+
+    async def _post_departed_claims_note(
+        self, removed: list[tuple[int, list[CharacterClaim]]]
+    ) -> None:
+        """One officer note listing auto-removed claims + ranks to demote."""
+        channel_id = await self.get_claim_review_channel_id()
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            return
+        snapshot = await self.data.get_snapshot()
+        body: list[str] = []
+        for user_id, user_claims in removed:
+            parts = []
+            for claim in sorted(user_claims, key=lambda c: c.character_name.casefold()):
+                snap = snapshot.get(claim.character_key)
+                if snap is not None and snap.guild_rank is not None:
+                    parts.append(
+                        f"**{claim.character_name}** ({self._rank_label(snap.guild_rank)})"
+                    )
+                else:
+                    parts.append(f"**{claim.character_name}**")
+            body.append(f"- <@{user_id}>: " + ", ".join(parts))
+        header = (
+            "🚪 **Claims automatisch entfernt** — diese User haben Discord "
+            "verlassen. Bitte Member+-Chars in-game runterstufen:"
+        )
+        for chunk in _pack_digest_sections_into_chunks([(header, body)]):
+            try:
+                await channel.send(chunk)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning(
+                    "[WoWCog] Could not post departed-claims note to %s: %s",
+                    channel_id,
+                    exc,
+                )
+                return
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        """Live counterpart to :meth:`prune_departed_claims` — drop a leaving
+        member's claims the moment they leave the Discord server."""
+        main_guild_id = getattr(self.bot, "main_guild_id", None)
+        if main_guild_id is not None and member.guild.id != main_guild_id:
+            return
+        removed = await self._remove_user_claims(member.id)
+        if removed:
+            logger.info(
+                "[WoWCog] Member %s left Discord — removed %d claim(s).",
+                member.id,
+                len(removed),
+            )
+            await self._post_departed_claims_note([(member.id, removed)])
+
     async def build_sync_report(self, members: list[RosterMember]) -> SyncReport:
         """Compare verified claims against in-game ranks (see :class:`SyncReport`).
 
@@ -1202,32 +1302,21 @@ class WoWCog(ManagedTaskCog):
         # never flag them for "claim or kick".
         bank_keys = {b.character_key for b in await self.data.list_bank_characters()}
 
-        guild = self._main_guild()
-        # Cache Discord-presence per user across all their claims.
-        presence: dict[int, bool] = {}
-
         initiate_claims: list[tuple[CharacterClaim, RosterMember]] = []
-        claims_left_discord: list[tuple[CharacterClaim, RosterMember]] = []
         member_claims_by_user: dict[int, list[tuple[CharacterClaim, RosterMember]]] = {}
+        # All verified, alive claimed chars per user — drives the "no Main" check.
+        chars_by_user: dict[int, list[RosterMember]] = {}
         for claim in verified:
             member = members_by_key.get(claim.character_key)
             if member is None or member.guild_rank is None:
                 continue
             if member.guild_rank == INITIATE_RANK:
                 initiate_claims.append((claim, member))
-            # Member+ char whose claiming Discord user has left the server →
-            # officer demotes it in-game. Skipped entirely without a guild.
-            if guild is not None and member.guild_rank <= MEMBER_RANK:
-                if claim.discord_user_id not in presence:
-                    presence[claim.discord_user_id] = (
-                        await self._discord_member_present(guild, claim.discord_user_id)
-                    )
-                if not presence[claim.discord_user_id]:
-                    claims_left_discord.append((claim, member))
             if member.guild_rank <= MEMBER_RANK:
                 member_claims_by_user.setdefault(claim.discord_user_id, []).append(
                     (claim, member)
                 )
+            chars_by_user.setdefault(claim.discord_user_id, []).append(member)
 
         unclaimed_ranked = [
             member
@@ -1243,14 +1332,27 @@ class WoWCog(ManagedTaskCog):
             if len(claims) > 1
         ]
 
+        # Standing invariant: a user with a Twink/Bank char but NO Member+ main.
+        # Initiate-only owners are new/probation and not flagged.
+        no_main_users: list[tuple[int, list[RosterMember]]] = []
+        for user_id, chars in chars_by_user.items():
+            if any(m.guild_rank <= MEMBER_RANK for m in chars):
+                continue
+            if not any(m.guild_rank in (BANK_RANK, TWINK_RANK) for m in chars):
+                continue
+            ordered = sorted(
+                chars, key=lambda m: (-m.level, m.guild_rank, m.name.casefold())
+            )
+            no_main_users.append((user_id, ordered))
+
         initiate_claims.sort(key=lambda pair: pair[0].character_name.casefold())
         unclaimed_ranked.sort(key=lambda m: (m.guild_rank, m.name.casefold()))
-        claims_left_discord.sort(key=lambda pair: (pair[1].guild_rank, pair[1].name))
+        no_main_users.sort(key=lambda pair: pair[0])
         multi_member_users.sort(key=lambda pair: pair[0])
         return SyncReport(
             initiate_claims=initiate_claims,
             unclaimed_ranked=unclaimed_ranked,
-            claims_left_discord=claims_left_discord,
+            no_main_users=no_main_users,
             multi_member_users=multi_member_users,
         )
 
@@ -1284,16 +1386,18 @@ class WoWCog(ManagedTaskCog):
                     body,
                 )
             )
-        if report.claims_left_discord:
-            body = [
-                f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
-                f"Level {member.level}) — Claim: <@{claim.discord_user_id}>"
-                for claim, member in report.claims_left_discord
-            ]
+        if report.no_main_users:
+            body = []
+            for user_id, chars in report.no_main_users:
+                chars_str = ", ".join(
+                    f"**{m.name}** ({self._rank_label(m.guild_rank)}, Level {m.level})"
+                    for m in chars
+                )
+                body.append(f"- <@{user_id}>: {chars_str}")
             sections.append(
                 (
-                    "🚪 **Owner hat Discord verlassen** — Char in-game "
-                    "runterstufen (Claim entzogen sich selbst):",
+                    "**Twink/Bank ohne Main** — höchsten Char (zuerst gelistet) "
+                    "zum Member befördern:",
                     body,
                 )
             )
@@ -1370,6 +1474,9 @@ class WoWCog(ManagedTaskCog):
                 # Losing the last claimed char must cost the guild role; the
                 # hourly reconcile would catch it too, but do it immediately.
                 await self.reconcile_guild_role_for(claim.discord_user_id)
+                # If a Member+ main fell, alert officers to promote a
+                # replacement so the owner isn't left with only twinks/bank.
+                await self._notify_main_died(claim.discord_user_id, death.member)
             # Duo hook: memorial in the team thread if the fallen char was in
             # an active team. Independent of the claim (team keeps the key).
             await self._notify_duo_death(death)
@@ -1416,6 +1523,62 @@ class WoWCog(ManagedTaskCog):
             await duo.on_character_death(death.member.character_key, death.member.level)
         except Exception as exc:  # pragma: no cover - defensive integration logging
             logger.warning("[WoWCog] Duo-Death-Hook fehlgeschlagen: %s", exc)
+
+    async def _notify_main_died(self, owner_id: int, dead_member: RosterMember) -> None:
+        """Alert officers when a Member+ main dies and the owner is left with
+        only twinks/bank — so a replacement can be promoted to Member.
+
+        The invariant is: nobody keeps a Twink/Bank char without a Main. Fires
+        only when, after the death, the owner still has claimed chars, none is
+        Member+, and at least one is a Twink or Bank (Initiate-only survivors
+        are new/probation and not flagged).
+        """
+        if dead_member.guild_rank is None or dead_member.guild_rank > MEMBER_RANK:
+            return
+        snapshot = await self.data.get_snapshot()
+        remaining: list[RosterMember] = []
+        for claim in await self.data.claims_for_user(owner_id):
+            member = snapshot.get(claim.character_key)
+            if member is None or member.is_ghost or member.guild_rank is None:
+                continue
+            remaining.append(member)
+        if not remaining:
+            return
+        if any(m.guild_rank <= MEMBER_RANK for m in remaining):
+            return  # still has a Main
+        if not any(m.guild_rank in (BANK_RANK, TWINK_RANK) for m in remaining):
+            return  # only Initiates left — nothing orphaned yet
+
+        # Highest-level survivor first — the natural new-main candidate.
+        remaining.sort(key=lambda m: (-m.level, m.guild_rank, m.name.casefold()))
+        top = remaining[0]
+        lines = [
+            f"⚰️ **Main gefallen** — <@{owner_id}> hat mit "
+            f"**{dead_member.name}** ({self._rank_label(dead_member.guild_rank)}) "
+            "seinen Main verloren und hat jetzt keinen Member-Char mehr.",
+            "Verbleibende Chars:",
+        ]
+        for member in remaining:
+            hint = "  ← **Vorschlag: zum Member befördern**" if member is top else ""
+            lines.append(
+                f"- **{member.name}** ({self._rank_label(member.guild_rank)}, "
+                f"Level {member.level}){hint}"
+            )
+        await self._post_officer_text("\n".join(lines))
+
+    async def _post_officer_text(self, content: str) -> None:
+        """Send a plain message to the officer/claim-review channel."""
+        channel_id = await self.get_claim_review_channel_id()
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            logger.warning("[WoWCog] Officer channel %s not found.", channel_id)
+            return
+        try:
+            await channel.send(content)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.warning(
+                "[WoWCog] Could not post officer message to %s: %s", channel_id, exc
+            )
 
     async def _notify_duo_refresh(self) -> None:
         """Hourly: let the Duo cog refresh open posts against the fresh roster."""

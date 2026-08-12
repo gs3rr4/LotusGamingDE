@@ -3474,7 +3474,40 @@ async def test_sync_report_empty_when_everything_matches(tmp_path, patch_logged_
 
 
 @pytest.mark.asyncio
-async def test_sync_report_flags_owner_who_left_discord(
+async def test_sync_report_flags_twink_bank_without_main(tmp_path, patch_logged_task):
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    # User 700: Twink + Bank char, NO Member → flagged, highest-level suggested.
+    twink = ranked("id:1", "Twinki", 5, level=58)
+    bankc = ranked("id:2", "Lager", 4, level=30)
+    # User 800: has a real Member main → must NOT be flagged.
+    main = ranked("id:3", "Hauptmann", 3, level=60)
+    alt = ranked("id:4", "Nebenchar", 5, level=40)
+    await cog.data.replace_snapshot([twink, bankc, main, alt])
+    await _verify(cog, twink, 700)
+    await _verify(cog, bankc, 700)
+    await _verify(cog, main, 800)
+    await _verify(cog, alt, 800)
+
+    posted = await cog._post_sync_report([twink, bankc, main, alt])
+
+    assert posted >= 1
+    msg = "\n".join(sent[0] for sent in officer.sent)
+    assert "Twink/Bank ohne Main" in msg
+    assert "<@700>" in msg and "Twinki" in msg and "Lager" in msg
+    # Highest level (Twinki 58) listed before the bank char (Lager 30).
+    assert msg.index("Twinki") < msg.index("Lager")
+    # The user who still has a Member main is not flagged as main-less.
+    assert "<@800>" not in msg
+
+
+@pytest.mark.asyncio
+async def test_prune_departed_claims_removes_absent_users(
     tmp_path, patch_logged_task, monkeypatch
 ):
     monkeypatch.setattr(wow_cog_mod.discord, "Guild", FakeGuild)
@@ -3485,30 +3518,41 @@ async def test_sync_report_flags_owner_who_left_discord(
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    stays = ranked("id:1", "Bleibtchar", 3)  # Member, owner 100 still on Discord
-    left = ranked("id:2", "Wegchar", 3)  # Member, owner 500 left Discord
+    stays = ranked("id:1", "Bleibtchar", 3)  # owner 100 still on Discord
+    left = ranked("id:2", "Wegchar", 3)  # owner 500 left Discord
     await cog.data.replace_snapshot([stays, left])
     await _verify(cog, stays, 100)
     await _verify(cog, left, 500)
 
     role = FakeRole(wow_cog_mod.GUILD_ROLE_ID)
-    # Only 100 is in the guild; 500 has left → fetch_member(500) raises NotFound.
-    cog.bot.main_guild = FakeGuild(role, [FakeMember(100)])
+    cog.bot.main_guild = FakeGuild(role, [FakeMember(100)])  # 500 is gone
 
-    posted = await cog._post_sync_report([stays, left])
+    removed = await cog.prune_departed_claims()
 
-    assert posted >= 1
+    assert removed == 1
+    assert await cog.data.claims_for_user(500) == []  # departed → pruned
+    assert len(await cog.data.claims_for_user(100)) == 1  # present → kept
+    # Officer got a one-time note naming the freed char and its rank.
     msg = "\n".join(sent[0] for sent in officer.sent)
     assert "Discord verlassen" in msg
     assert "Wegchar" in msg and "<@500>" in msg
-    # The char whose owner is still around must not be flagged.
-    assert "Bleibtchar" not in msg
 
 
 @pytest.mark.asyncio
-async def test_sync_report_no_guild_skips_left_discord_check(
-    tmp_path, patch_logged_task
-):
+async def test_prune_departed_claims_no_guild_is_safe(tmp_path, patch_logged_task):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    solo = ranked("id:1", "Soloist", 3)
+    await cog.data.replace_snapshot([solo])
+    await _verify(cog, solo, 100)
+
+    # No main_guild resolvable → nothing pruned, no crash.
+    assert await cog.prune_departed_claims() == 0
+    assert len(await cog.data.claims_for_user(100)) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_member_remove_drops_claims(tmp_path, patch_logged_task, monkeypatch):
+    monkeypatch.setattr(wow_cog_mod.discord, "Guild", FakeGuild)
     officer = DummyChannel()
     bot = MultiChannelBot(public_channel=None, officer_channel=officer)
     patch_logged_task(wow_cog_mod, log_setup)
@@ -3516,12 +3560,72 @@ async def test_sync_report_no_guild_skips_left_discord_check(
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    # No main_guild resolvable → the left-Discord check is skipped, not a crash.
-    solo = ranked("id:1", "Soloist", 3)
-    await cog.data.replace_snapshot([solo])
-    await _verify(cog, solo, 100)
+    char = ranked("id:1", "Verlassen", 3)
+    await cog.data.replace_snapshot([char])
+    await _verify(cog, char, 500)
 
-    assert await cog.sync_report_chunks([solo]) == []
+    role = FakeRole(wow_cog_mod.GUILD_ROLE_ID)
+    cog.bot.main_guild = FakeGuild(role, [])
+    cog.bot.main_guild_id = 4242
+    leaving = type("M", (), {"id": 500, "guild": type("G", (), {"id": 4242})()})()
+
+    await cog.on_member_remove(leaving)
+
+    assert await cog.data.claims_for_user(500) == []
+    assert "Verlassen" in "\n".join(sent[0] for sent in officer.sent)
+
+
+async def _main_died_cog(tmp_path, patch_logged_task):
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+    return cog, officer
+
+
+@pytest.mark.asyncio
+async def test_notify_main_died_suggests_promotion(tmp_path, patch_logged_task):
+    cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
+    twink = ranked("id:2", "Twinki", 5, level=58)  # only a twink survives
+    await cog.data.replace_snapshot([twink])
+    await _verify(cog, twink, 100)
+
+    dead_main = ranked("id:1", "Deadmain", 3, level=60)
+    await cog._notify_main_died(100, dead_main)
+
+    msg = "\n".join(sent[0] for sent in officer.sent)
+    assert "Main gefallen" in msg and "<@100>" in msg
+    assert "Twinki" in msg and "Vorschlag" in msg
+
+
+@pytest.mark.asyncio
+async def test_notify_main_died_skips_when_another_main_remains(
+    tmp_path, patch_logged_task
+):
+    cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
+    second_main = ranked("id:2", "Zweitmain", 3, level=60)  # still a Member
+    await cog.data.replace_snapshot([second_main])
+    await _verify(cog, second_main, 100)
+
+    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 3))
+
+    assert officer.sent == []
+
+
+@pytest.mark.asyncio
+async def test_notify_main_died_skips_initiate_only_survivors(
+    tmp_path, patch_logged_task
+):
+    cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
+    initiate = ranked("id:2", "Neuling", 6, level=20)  # only a probation char
+    await cog.data.replace_snapshot([initiate])
+    await _verify(cog, initiate, 100)
+
+    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 3))
+
+    assert officer.sent == []
 
 
 @pytest.mark.asyncio

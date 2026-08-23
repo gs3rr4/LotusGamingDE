@@ -460,8 +460,8 @@ async def test_member_claims_shows_rank_and_sorts_main_first(
     tmp_path, patch_logged_task
 ):
     cog = await create_cog(tmp_path, patch_logged_task)
-    main = ranked("id:1", "Mainchar", 3, level=60)  # Member
-    twink = ranked("id:2", "Twinkerl", 5, level=41)  # Twink
+    main = ranked("id:1", "Mainchar", 4, level=60)  # Member
+    twink = ranked("id:2", "Twinkerl", 6, level=41)  # Twink
     await cog.data.replace_snapshot([main, twink])
     await cog.data.create_claim(main, 99)
     await cog.data.create_claim(twink, 99)
@@ -3332,8 +3332,8 @@ async def test_sync_guild_role_strips_when_claimed_char_left_guild(
     monkeypatch.setattr(wow_cog_mod.discord, "Guild", FakeGuild)
     cog = await create_cog(tmp_path, patch_logged_task)
 
-    left = ranked("id:left", "Leaver", 5)
-    still_here = ranked("id:other", "Stillhere", 2)
+    left = ranked("id:left", "Leaver", 6)
+    still_here = ranked("id:other", "Stillhere", 3)
     await cog.data.create_claim(left, 555)
     await cog.data.verify_claim(left.character_key, 999)
     # Roster no longer contains the claimed char, but is NOT empty.
@@ -3403,15 +3403,15 @@ async def test_sync_report_flags_all_categories(tmp_path, patch_logged_task):
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    main_a = ranked("id:1", "Maina", 3)  # Member, verified (user 100's main)
-    main_a2 = ranked("id:2", "Zweitmain", 2)  # Veteran, verified (100 → 2nd Member+)
-    initiate_claimed = ranked("id:3", "Neulor", 6)  # verified but still Initiate
-    twink = ranked("id:4", "Twinkus", 5)  # verified twink → fine
-    pending = ranked("id:5", "Pendlor", 6)  # UNVERIFIED claim → protected from kick
-    legacy_member = ranked("id:6", "Altmember", 3)  # Member, no claim
-    bank_noclaim = ranked("id:7", "Bankus", 4)  # Bank rank, no claim → Twink+ section
-    gbank = ranked("id:8", "Tresor", 4)  # Bank rank, registered gbank → excluded
-    kickable = ranked("id:9", "Kickmich", 6)  # Initiate, no claim → kick list
+    main_a = ranked("id:1", "Maina", 4)  # Member, verified (user 100's main)
+    main_a2 = ranked("id:2", "Zweitmain", 3)  # Veteran, verified (100 → 2nd Member+)
+    initiate_claimed = ranked("id:3", "Neulor", 7)  # verified but still Initiate
+    twink = ranked("id:4", "Twinkus", 6)  # verified twink → fine
+    pending = ranked("id:5", "Pendlor", 7)  # UNVERIFIED claim → protected from kick
+    legacy_member = ranked("id:6", "Altmember", 4)  # Member, no claim
+    bank_noclaim = ranked("id:7", "Bankus", 5)  # Bank rank, no claim → Twink+ section
+    gbank = ranked("id:8", "Tresor", 5)  # Bank rank, registered gbank → excluded
+    kickable = ranked("id:9", "Kickmich", 7)  # Initiate, no claim → kick list
     roster = [
         main_a,
         main_a2,
@@ -3460,9 +3460,9 @@ async def test_sync_report_empty_when_everything_matches(tmp_path, patch_logged_
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    main = ranked("id:1", "Main", 3)  # Member, verified
-    twink = ranked("id:2", "Twink", 5)  # Twink, verified (same user, fine)
-    bank = ranked("id:3", "Bank", 4)  # Bank rank, registered gbank → excluded
+    main = ranked("id:1", "Main", 4)  # Member, verified
+    twink = ranked("id:2", "Twink", 6)  # Twink, verified (same user, fine)
+    bank = ranked("id:3", "Bank", 5)  # Bank rank, registered gbank → excluded
     await cog.data.replace_snapshot([main, twink, bank])
     await _verify(cog, main, 100)
     await _verify(cog, twink, 100)
@@ -3483,11 +3483,11 @@ async def test_sync_report_flags_twink_bank_without_main(tmp_path, patch_logged_
     CREATED_COGS.append(cog)
 
     # User 700: Twink + Bank char, NO Member → flagged, highest-level suggested.
-    twink = ranked("id:1", "Twinki", 5, level=58)
-    bankc = ranked("id:2", "Lager", 4, level=30)
+    twink = ranked("id:1", "Twinki", 6, level=58)
+    bankc = ranked("id:2", "Lager", 5, level=30)
     # User 800: has a real Member main → must NOT be flagged.
-    main = ranked("id:3", "Hauptmann", 3, level=60)
-    alt = ranked("id:4", "Nebenchar", 5, level=40)
+    main = ranked("id:3", "Hauptmann", 4, level=60)
+    alt = ranked("id:4", "Nebenchar", 6, level=40)
     await cog.data.replace_snapshot([twink, bankc, main, alt])
     await _verify(cog, twink, 700)
     await _verify(cog, bankc, 700)
@@ -3507,6 +3507,35 @@ async def test_sync_report_flags_twink_bank_without_main(tmp_path, patch_logged_
 
 
 @pytest.mark.asyncio
+async def test_officer_twink_not_counted_as_second_main(tmp_path, patch_logged_task):
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    # User 100: Offizier main + sanctioned Officer-Twink alt → must NOT be flagged.
+    off_main = ranked("id:1", "Chefe", 1)  # Offizier
+    off_twink = ranked("id:2", "Chefezwo", 2)  # Officer Twink
+    # User 200: Offizier + a real Member → two mains → flagged.
+    boss = ranked("id:3", "Bossman", 1)  # Offizier
+    second = ranked("id:4", "Zweitmain", 4)  # Member
+    await cog.data.replace_snapshot([off_main, off_twink, boss, second])
+    await _verify(cog, off_main, 100)
+    await _verify(cog, off_twink, 100)
+    await _verify(cog, boss, 200)
+    await _verify(cog, second, 200)
+
+    await cog._post_sync_report([off_main, off_twink, boss, second])
+
+    msg = "\n".join(sent[0] for sent in officer.sent)
+    assert "Mehr als ein Main-Char" in msg
+    assert "<@200>" in msg  # two real mains → flagged
+    assert "<@100>" not in msg  # Officer Twink is the sanctioned exception
+
+
+@pytest.mark.asyncio
 async def test_prune_departed_claims_removes_absent_users(
     tmp_path, patch_logged_task, monkeypatch
 ):
@@ -3518,8 +3547,8 @@ async def test_prune_departed_claims_removes_absent_users(
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    stays = ranked("id:1", "Bleibtchar", 3)  # owner 100 still on Discord
-    left = ranked("id:2", "Wegchar", 3)  # owner 500 left Discord
+    stays = ranked("id:1", "Bleibtchar", 4)  # owner 100 still on Discord
+    left = ranked("id:2", "Wegchar", 4)  # owner 500 left Discord
     await cog.data.replace_snapshot([stays, left])
     await _verify(cog, stays, 100)
     await _verify(cog, left, 500)
@@ -3541,7 +3570,7 @@ async def test_prune_departed_claims_removes_absent_users(
 @pytest.mark.asyncio
 async def test_prune_departed_claims_no_guild_is_safe(tmp_path, patch_logged_task):
     cog = await create_cog(tmp_path, patch_logged_task)
-    solo = ranked("id:1", "Soloist", 3)
+    solo = ranked("id:1", "Soloist", 4)
     await cog.data.replace_snapshot([solo])
     await _verify(cog, solo, 100)
 
@@ -3560,7 +3589,7 @@ async def test_on_member_remove_drops_claims(tmp_path, patch_logged_task, monkey
     cog.data = WoWData(str(tmp_path / "wow.db"))
     CREATED_COGS.append(cog)
 
-    char = ranked("id:1", "Verlassen", 3)
+    char = ranked("id:1", "Verlassen", 4)
     await cog.data.replace_snapshot([char])
     await _verify(cog, char, 500)
 
@@ -3588,11 +3617,11 @@ async def _main_died_cog(tmp_path, patch_logged_task):
 @pytest.mark.asyncio
 async def test_notify_main_died_suggests_promotion(tmp_path, patch_logged_task):
     cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
-    twink = ranked("id:2", "Twinki", 5, level=58)  # only a twink survives
+    twink = ranked("id:2", "Twinki", 6, level=58)  # only a twink survives
     await cog.data.replace_snapshot([twink])
     await _verify(cog, twink, 100)
 
-    dead_main = ranked("id:1", "Deadmain", 3, level=60)
+    dead_main = ranked("id:1", "Deadmain", 4, level=60)
     await cog._notify_main_died(100, dead_main)
 
     msg = "\n".join(sent[0] for sent in officer.sent)
@@ -3605,11 +3634,11 @@ async def test_notify_main_died_skips_when_another_main_remains(
     tmp_path, patch_logged_task
 ):
     cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
-    second_main = ranked("id:2", "Zweitmain", 3, level=60)  # still a Member
+    second_main = ranked("id:2", "Zweitmain", 4, level=60)  # still a Member
     await cog.data.replace_snapshot([second_main])
     await _verify(cog, second_main, 100)
 
-    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 3))
+    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 4))
 
     assert officer.sent == []
 
@@ -3619,11 +3648,11 @@ async def test_notify_main_died_skips_initiate_only_survivors(
     tmp_path, patch_logged_task
 ):
     cog, officer = await _main_died_cog(tmp_path, patch_logged_task)
-    initiate = ranked("id:2", "Neuling", 6, level=20)  # only a probation char
+    initiate = ranked("id:2", "Neuling", 7, level=20)  # only a probation char
     await cog.data.replace_snapshot([initiate])
     await _verify(cog, initiate, 100)
 
-    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 3))
+    await cog._notify_main_died(100, ranked("id:1", "Deadmain", 4))
 
     assert officer.sent == []
 
@@ -3633,8 +3662,8 @@ async def test_claim_review_message_hints_twink_when_user_has_member(
     tmp_path, patch_logged_task
 ):
     cog = await create_cog(tmp_path, patch_logged_task)
-    main = ranked("id:1", "Hauptmann", 3)  # existing Member char
-    twink = ranked("id:2", "Zwergnase", 6)  # the newly claimed char (Initiate)
+    main = ranked("id:1", "Hauptmann", 4)  # existing Member char
+    twink = ranked("id:2", "Zwergnase", 7)  # the newly claimed char (Initiate)
     await cog.data.replace_snapshot([main, twink])
     await _verify(cog, main, 100)
     new_claim, _ = await cog.data.create_claim(twink, 100)
@@ -3651,7 +3680,7 @@ async def test_claim_review_message_recommends_member_for_first_claim(
     tmp_path, patch_logged_task
 ):
     cog = await create_cog(tmp_path, patch_logged_task)
-    first = ranked("id:1", "Erstchar", 6)
+    first = ranked("id:1", "Erstchar", 7)
     await cog.data.replace_snapshot([first])
     claim, _ = await cog.data.create_claim(first, 100)
 

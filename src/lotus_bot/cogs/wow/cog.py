@@ -58,18 +58,22 @@ DEFAULT_ROSTER_REFRESH_INTERVAL = 60 * 60
 GUILD_RANKS = {
     0: "Gildenmeister",
     1: "Offizier",
-    2: "Veteran",
-    3: "Member",
-    4: "Bank",
-    5: "Twink",
-    6: "Initiate",
+    2: "Officer Twink",
+    3: "Veteran",
+    4: "Member",
+    5: "Bank",
+    6: "Twink",
+    7: "Initiate",
 }
-MEMBER_RANK = 3
-BANK_RANK = 4
+# "Officer Twink" is a sanctioned SECOND high-rank char for an officer — it sits
+# above Member but does NOT count as a main slot (see the multi-main check).
+OFFICER_TWINK_RANK = 2
+MEMBER_RANK = 4
+BANK_RANK = 5
 # Everyone at Twink rank or higher (rank <= TWINK_RANK) is expected to have a
 # char claim; only Initiate (below Twink) is the unclaimed "probation" tier.
-TWINK_RANK = 5
-INITIATE_RANK = 6
+TWINK_RANK = 6
+INITIATE_RANK = 7
 try:
     DIGEST_TIMEZONE = ZoneInfo("Europe/Berlin")
 except ZoneInfoNotFoundError:  # pragma: no cover - depends on host tzdata
@@ -339,7 +343,8 @@ class SyncReport:
       a Twink/Bank char but NO Member+ main (e.g. their main died). The highest
       remaining char should be promoted. Initiate-only owners are not flagged.
     * ``multi_member_users`` — ``(discord_user_id, [(claim, member), ...])`` for
-      users with more than one Member+ char (invariant: only one allowed).
+      users with more than one Member+ "main slot" char (invariant: only one
+      allowed). The sanctioned Officer-Twink rank is excluded from this count.
 
     Note: claims whose Discord owner has left the server are pruned
     automatically (see :meth:`WoWCog.prune_departed_claims`), so they never
@@ -1312,7 +1317,12 @@ class WoWCog(ManagedTaskCog):
                 continue
             if member.guild_rank == INITIATE_RANK:
                 initiate_claims.append((claim, member))
-            if member.guild_rank <= MEMBER_RANK:
+            # "Main slot" = Member+ but NOT the sanctioned Officer-Twink alt, so
+            # an Offizier main + Officer-Twink second char isn't flagged.
+            if (
+                member.guild_rank <= MEMBER_RANK
+                and member.guild_rank != OFFICER_TWINK_RANK
+            ):
                 member_claims_by_user.setdefault(claim.discord_user_id, []).append(
                     (claim, member)
                 )
@@ -1411,8 +1421,8 @@ class WoWCog(ManagedTaskCog):
                 body.append(f"- <@{user_id}>: {chars}")
             sections.append(
                 (
-                    "**Mehr als ein Member+-Char** — nur einer soll Member+ "
-                    "sein, Rest → Twink:",
+                    "**Mehr als ein Main-Char** — nur einer soll Member+ sein "
+                    "(Officer Twink zählt nicht), Rest → Twink:",
                     body,
                 )
             )

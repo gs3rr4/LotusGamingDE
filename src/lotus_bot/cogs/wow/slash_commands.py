@@ -703,6 +703,37 @@ async def claims_list(interaction: discord.Interaction, status: str = "all"):
     )
 
 
+@claims_group.command(
+    name="repost",
+    description="Postet fehlende Claim-Review-Karten erneut (nur Mods)",
+)
+@moderator_only()
+@app_commands.default_permissions(manage_guild=True)
+async def claims_repost(interaction: discord.Interaction):
+    logger.info(f"/wow claims repost by {interaction.user}")
+    cog: WoWCog | None = interaction.client.get_cog("WoWCog")
+    if cog is None:
+        await interaction.response.send_message(
+            "❌ WoW-System nicht verfügbar.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    reposted, failed = await cog.repost_missing_claim_reviews()
+    if reposted == 0 and failed == 0:
+        await interaction.followup.send(
+            "✅ Alle offenen Claims haben bereits eine Review-Karte — nichts zu tun."
+        )
+        return
+    msg = f"✅ {reposted} Review-Karte(n) neu gepostet."
+    if failed:
+        msg += (
+            f"\n⚠️ {failed} fehlgeschlagen — prüfe die Schreibrechte des Bots "
+            "im Offi-Channel."
+        )
+    await interaction.followup.send(msg)
+
+
 cooldowns_group = app_commands.Group(
     name="cooldowns",
     description="WoW Craft-Cooldowns (Transmute, Mooncloth, ...)",

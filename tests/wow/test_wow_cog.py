@@ -3536,6 +3536,32 @@ async def test_officer_twink_not_counted_as_second_main(tmp_path, patch_logged_t
 
 
 @pytest.mark.asyncio
+async def test_repost_missing_claim_reviews(tmp_path, patch_logged_task):
+    officer = DummyChannel()
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    alpha = member(key="id:1", name="Alpha")
+    beta = member(key="id:2", name="Beta")
+    await cog.data.replace_snapshot([alpha, beta])
+    # id:1 = claimed while the bot lacked channel perms → no review card yet.
+    await cog.data.create_claim(alpha, 100)
+    # id:2 = already has a review card and must NOT be reposted.
+    await cog.data.create_claim(beta, 200)
+    await cog.data.set_claim_review_message("id:2", 555)
+
+    reposted, failed = await cog.repost_missing_claim_reviews()
+
+    assert (reposted, failed) == (1, 0)
+    assert (await cog.data.get_claim("id:1")).review_message_id is not None
+    assert (await cog.data.get_claim("id:2")).review_message_id == 555
+    assert officer.sent  # a card was actually posted
+
+
+@pytest.mark.asyncio
 async def test_prune_departed_claims_removes_absent_users(
     tmp_path, patch_logged_task, monkeypatch
 ):

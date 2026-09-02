@@ -2357,6 +2357,29 @@ class WoWCog(ManagedTaskCog):
         await self.data.set_claim_review_message(claim.character_key, message.id)
         return True
 
+    async def repost_missing_claim_reviews(self) -> tuple[int, int]:
+        """Re-post review cards for unverified claims that never got one.
+
+        Fixes claims made while the bot lacked permission in the review channel:
+        the claim persisted in the DB (``create_claim`` runs before the post),
+        but its review card + approve/reject buttons never appeared. Only claims
+        with no ``review_message_id`` are reposted, so already-carded claims are
+        never duplicated. Returns ``(reposted, failed)``.
+        """
+        pending = [
+            claim
+            for claim in await self.data.list_claims("unverified")
+            if claim.review_message_id is None
+        ]
+        reposted = 0
+        failed = 0
+        for claim in pending:
+            if await self._post_claim_review(claim):
+                reposted += 1
+            else:
+                failed += 1
+        return reposted, failed
+
     def format_claim_review(self, claim: CharacterClaim) -> str:
         return (
             f"<@{claim.discord_user_id}> möchte **{claim.character_name}** verbinden "

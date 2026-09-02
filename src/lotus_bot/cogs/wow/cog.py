@@ -40,7 +40,11 @@ DEFAULT_REALM_SLUG = "soulseeker"
 DEFAULT_GUILD_SLUG = "black-lotus"
 DEFAULT_GUILD_NAME = "Black Lotus"
 DEFAULT_POLL_INTERVAL = 3 * 60 * 60
-DEFAULT_CLAIM_REVIEW_CHANNEL_ID = 1184115540822855772
+# Officer bot channel — receives ALL officer-facing bot output: claim reviews,
+# the sync report, gbank requests, departed-claim / main-died / promote notes.
+# Moved off the human discussion channel (1184115540822855772) into #wow-logs so
+# officer chat isn't drowned out by bot posts.
+DEFAULT_CLAIM_REVIEW_CHANNEL_ID = 1544601948169314324
 DEFAULT_PANEL_CHANNEL_ID = 1463577361562992807
 DEFAULT_DIGEST_HOUR = 9
 # Guild role the bot fully owns: granted to every member with at least one

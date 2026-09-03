@@ -2357,23 +2357,48 @@ class WoWCog(ManagedTaskCog):
         await self.data.set_claim_review_message(claim.character_key, message.id)
         return True
 
-    async def repost_missing_claim_reviews(self) -> tuple[int, int]:
-        """Re-post review cards for unverified claims that never got one.
+    async def _claim_review_message_exists(self, channel, message_id: int) -> bool:
+        """True if the stored review message still lives in ``channel``.
 
-        Fixes claims made while the bot lacked permission in the review channel:
-        the claim persisted in the DB (``create_claim`` runs before the post),
-        but its review card + approve/reject buttons never appeared. Only claims
-        with no ``review_message_id`` are reposted, so already-carded claims are
-        never duplicated. Returns ``(reposted, failed)``.
+        Returns ``False`` only when Discord confirms the message is gone
+        (``NotFound``) — e.g. it was manually deleted, or it lives in the old
+        review channel after a channel switch. On transient/permission errors
+        (or no channel) it returns ``True`` so a momentarily unreachable channel
+        never triggers duplicate cards.
         """
-        pending = [
-            claim
-            for claim in await self.data.list_claims("unverified")
-            if claim.review_message_id is None
-        ]
+        if channel is None:
+            return True
+        try:
+            await channel.fetch_message(message_id)
+            return True
+        except discord.NotFound:
+            return False
+        except (discord.Forbidden, discord.HTTPException):
+            return True
+
+    async def repost_missing_claim_reviews(self) -> tuple[int, int]:
+        """Re-post review cards for unverified claims that lack a live one.
+
+        Fixes two cases: (1) a claim made while the bot lacked permission in the
+        review channel — the claim persisted in the DB (``create_claim`` runs
+        before the post) but its review card never appeared; (2) a review card
+        that was manually deleted in Discord (or left behind in the old channel
+        after a channel switch) — the DB still points at a message that no longer
+        exists. A claim is reposted when it has no ``review_message_id`` **or**
+        that message is confirmed gone, so live cards are never duplicated.
+        Returns ``(reposted, failed)``.
+        """
+        channel_id = await self.get_claim_review_channel_id()
+        channel = self.bot.get_channel(channel_id)
         reposted = 0
         failed = 0
-        for claim in pending:
+        for claim in await self.data.list_claims("unverified"):
+            if claim.review_message_id is not None and (
+                await self._claim_review_message_exists(
+                    channel, claim.review_message_id
+                )
+            ):
+                continue
             if await self._post_claim_review(claim):
                 reposted += 1
             else:

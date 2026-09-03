@@ -20,15 +20,23 @@ async def close_created_cogs():
 
 
 class DummyChannel:
-    def __init__(self):
+    def __init__(self, missing_message_ids=None):
         self.sent = []
         self.next_message_id = 555
+        # Message ids that fetch_message should report as deleted (NotFound).
+        self.missing_message_ids = set(missing_message_ids or ())
 
     async def send(self, msg=None, **kwargs):
         # Real discord.TextChannel.send() makes content optional — a V2
         # LayoutView is sent without any text body. Mirror that here.
         self.sent.append((msg, kwargs))
         return type("Message", (), {"id": self.next_message_id})()
+
+    async def fetch_message(self, message_id):
+        if message_id in self.missing_message_ids:
+            response = type("Response", (), {"status": 404, "reason": "Not Found"})()
+            raise discord.NotFound(response, {"message": "Unknown Message"})
+        return type("Message", (), {"id": message_id})()
 
 
 class DummyPanelMessage:
@@ -3559,6 +3567,29 @@ async def test_repost_missing_claim_reviews(tmp_path, patch_logged_task):
     assert (await cog.data.get_claim("id:1")).review_message_id is not None
     assert (await cog.data.get_claim("id:2")).review_message_id == 555
     assert officer.sent  # a card was actually posted
+
+
+async def test_repost_reposts_manually_deleted_card(tmp_path, patch_logged_task):
+    # id:2 has a stored review_message_id (200) but its Discord message was
+    # manually deleted → fetch_message reports it gone → it must be reposted.
+    officer = DummyChannel(missing_message_ids={200})
+    bot = MultiChannelBot(public_channel=None, officer_channel=officer)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(bot)
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    beta = member(key="id:2", name="Beta")
+    await cog.data.replace_snapshot([beta])
+    await cog.data.create_claim(beta, 200)
+    await cog.data.set_claim_review_message("id:2", 200)
+
+    reposted, failed = await cog.repost_missing_claim_reviews()
+
+    assert (reposted, failed) == (1, 0)
+    # A fresh card was posted and the stored id points at the new message.
+    assert officer.sent
+    assert (await cog.data.get_claim("id:2")).review_message_id == 555
 
 
 @pytest.mark.asyncio

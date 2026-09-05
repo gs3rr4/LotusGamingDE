@@ -26,6 +26,7 @@ class MarketplaceListing:
     tag_kind: str  # 'biete' | 'suche'
     status: str  # 'open' | 'done'
     created_at: str
+    character_key: str | None = None
 
 
 @dataclass
@@ -38,6 +39,7 @@ class MarketplaceCraftingRequest:
     claimed_by_discord_user_id: int | None
     claimed_at: str | None
     created_at: str
+    requester_character_key: str | None = None
 
 
 class MarketplaceData:
@@ -101,9 +103,26 @@ class MarketplaceData:
                 PRIMARY KEY(requester_discord_user_id, item_key)
             )
             """)
+        # Which of the poster's/requester's claimed characters this post is
+        # actually about - lets the thread show e.g. "Voidok (Twink von
+        # Lyxendra)" instead of an anonymous Discord mention. Additive/
+        # nullable: old rows (before this column existed) simply have none.
+        await self._ensure_column(db, "marketplace_listings", "character_key", "TEXT")
+        await self._ensure_column(
+            db, "marketplace_crafting_requests", "requester_character_key", "TEXT"
+        )
         await db.commit()
         self._init_done = True
         logger.info("[MarketplaceData] SQLite database initialized.")
+
+    @staticmethod
+    async def _ensure_column(
+        db: aiosqlite.Connection, table: str, column: str, definition: str
+    ) -> None:
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in await cur.fetchall()}
+        if column not in columns:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     async def get_setting(self, key: str) -> str | None:
         await self.init_db()
@@ -135,7 +154,11 @@ class MarketplaceData:
     # ---- generic listings ----
 
     async def create_listing(
-        self, thread_id: int, poster_discord_user_id: int, tag_kind: str
+        self,
+        thread_id: int,
+        poster_discord_user_id: int,
+        tag_kind: str,
+        character_key: str | None = None,
     ) -> MarketplaceListing:
         await self.init_db()
         db = await self._get_db()
@@ -143,10 +166,11 @@ class MarketplaceData:
         await db.execute(
             """
             INSERT INTO marketplace_listings(
-                thread_id, poster_discord_user_id, tag_kind, status, created_at
-            ) VALUES (?, ?, ?, 'open', ?)
+                thread_id, poster_discord_user_id, tag_kind, status, created_at,
+                character_key
+            ) VALUES (?, ?, ?, 'open', ?, ?)
             """,
-            (thread_id, poster_discord_user_id, tag_kind, now),
+            (thread_id, poster_discord_user_id, tag_kind, now, character_key),
         )
         await db.commit()
         listing = await self.get_listing(thread_id)
@@ -159,7 +183,8 @@ class MarketplaceData:
         db = await self._get_db()
         cur = await db.execute(
             """
-            SELECT thread_id, poster_discord_user_id, tag_kind, status, created_at
+            SELECT thread_id, poster_discord_user_id, tag_kind, status, created_at,
+                   character_key
               FROM marketplace_listings WHERE thread_id = ?
             """,
             (thread_id,),
@@ -184,6 +209,7 @@ class MarketplaceData:
         requester_discord_user_id: int,
         item_name: str,
         item_key: str,
+        requester_character_key: str | None = None,
     ) -> MarketplaceCraftingRequest:
         await self.init_db()
         db = await self._get_db()
@@ -192,10 +218,17 @@ class MarketplaceData:
             """
             INSERT INTO marketplace_crafting_requests(
                 thread_id, requester_discord_user_id, item_name, item_key,
-                status, created_at
-            ) VALUES (?, ?, ?, ?, 'open', ?)
+                status, created_at, requester_character_key
+            ) VALUES (?, ?, ?, ?, 'open', ?, ?)
             """,
-            (thread_id, requester_discord_user_id, item_name, item_key, now),
+            (
+                thread_id,
+                requester_discord_user_id,
+                item_name,
+                item_key,
+                now,
+                requester_character_key,
+            ),
         )
         await db.commit()
         request = await self.get_crafting_request(thread_id)
@@ -211,7 +244,8 @@ class MarketplaceData:
         cur = await db.execute(
             """
             SELECT thread_id, requester_discord_user_id, item_name, item_key,
-                   status, claimed_by_discord_user_id, claimed_at, created_at
+                   status, claimed_by_discord_user_id, claimed_at, created_at,
+                   requester_character_key
               FROM marketplace_crafting_requests WHERE thread_id = ?
             """,
             (thread_id,),
@@ -287,6 +321,7 @@ def _listing_from_row(row: tuple[Any, ...]) -> MarketplaceListing:
         tag_kind=row[2],
         status=row[3],
         created_at=row[4],
+        character_key=row[5] if len(row) > 5 else None,
     )
 
 
@@ -300,4 +335,5 @@ def _crafting_request_from_row(row: tuple[Any, ...]) -> MarketplaceCraftingReque
         claimed_by_discord_user_id=row[5],
         claimed_at=row[6],
         created_at=row[7],
+        requester_character_key=row[8] if len(row) > 8 else None,
     )

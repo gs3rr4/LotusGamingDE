@@ -26,7 +26,7 @@ Bewusst NICHT verändert: ``WoWCog.search_crafting``/``search_crafting_by_item_i
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
 from discord.ext import commands
@@ -182,9 +182,27 @@ class MarketplaceCog(ManagedTaskCog):
     # ---- hub entry points ----
 
     async def open_crafting_request(self, interaction: discord.Interaction) -> None:
+        wow = self.wow
+        claims = await wow.data.claims_for_user(interaction.user.id) if wow else []
+        if not claims:
+            await interaction.response.send_message(
+                "Du brauchst mindestens einen geclaimten Char, um hier "
+                "mitzumachen. Nutze zuerst `/wow claim`.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_modal(MarketplaceCraftingItemModal(self))
 
     async def open_generic_listing(self, interaction: discord.Interaction) -> None:
+        wow = self.wow
+        claims = await wow.data.claims_for_user(interaction.user.id) if wow else []
+        if not claims:
+            await interaction.response.send_message(
+                "Du brauchst mindestens einen geclaimten Char, um hier "
+                "mitzumachen. Nutze zuerst `/wow claim`.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message(
             "Was möchtest du posten?",
             view=MarketplaceKindChooseView(self),
@@ -196,37 +214,107 @@ class MarketplaceCog(ManagedTaskCog):
 
     # ---- generic listing flow ----
 
-    async def publish_listing(
+    async def choose_character_for_listing(
         self,
         interaction: discord.Interaction,
         kind: str,
         title: str,
         description: str,
     ) -> None:
-        forum = self.forum()
-        if forum is None:
+        """After the title/description modal: pick WHICH claimed char this
+        post is about (skipped automatically if the user only has one) —
+        the thread then shows e.g. "Angebot von Voidok (Twink von Lyxendra)"
+        instead of an anonymous Discord mention, and picking one character
+        also gates out anyone without a single claimed char at all."""
+        wow = self.wow
+        claims = await wow.data.claims_for_user(interaction.user.id) if wow else []
+        if not claims:
             await interaction.response.send_message(
-                "❌ Marktplatz aktuell nicht verfügbar.", ephemeral=True
+                "Du brauchst mindestens einen geclaimten Char, um hier "
+                "mitzumachen. Nutze zuerst `/wow claim`.",
+                ephemeral=True,
             )
             return
+        if len(claims) == 1:
+            await self.publish_listing(
+                interaction,
+                kind,
+                title,
+                description,
+                claims[0].character_key,
+                edit=False,
+            )
+            return
+
+        async def on_selected(
+            picker_interaction: discord.Interaction, character_key: str
+        ) -> None:
+            await self.publish_listing(
+                picker_interaction, kind, title, description, character_key, edit=True
+            )
+
+        choices = [(c.character_key, c.character_name) for c in claims]
+        view = MarketplaceCharacterSelectView(interaction.user.id, choices, on_selected)
+        await interaction.response.send_message(
+            "Welcher Char bietet/sucht das?", view=view, ephemeral=True
+        )
+
+    async def publish_listing(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        title: str,
+        description: str,
+        character_key: str,
+        *,
+        edit: bool,
+    ) -> None:
+        """``edit=True`` when called from the character-picker's own select
+        callback (edits that ephemeral message in place); ``edit=False``
+        when called directly off the title/description modal's own
+        interaction (that modal's "origin message" is the shared hub post,
+        so it must get a brand-new ephemeral response, not an edit)."""
+        forum = self.forum()
+        if forum is None:
+            msg = "❌ Marktplatz aktuell nicht verfügbar."
+            if edit:
+                await interaction.response.edit_message(content=msg, view=None)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+        wow = self.wow
+        label = (
+            await wow.character_display_label(character_key)
+            if wow is not None
+            else f"<@{interaction.user.id}>"
+        )
         prefix = "🛒 " if kind == "biete" else "🔍 "
         thread_name = (prefix + title.strip())[:100]
         kind_label = "Angebot" if kind == "biete" else "Gesuch"
         body_lines = [description.strip()] if description.strip() else []
-        body_lines.append(f"\n{kind_label} von <@{interaction.user.id}>")
+        body_lines.append(f"\n{kind_label} von {label}")
         tag_name = TAG_BIETE if kind == "biete" else TAG_SUCHE
 
-        await interaction.response.defer(ephemeral=True)
+        if edit:
+            await interaction.response.edit_message(
+                content="⏳ Erstelle Marktplatz-Post ...", view=None
+            )
+        else:
+            await interaction.response.defer(ephemeral=True)
         created = await forum.create_thread(
             name=thread_name,
             content="\n".join(body_lines),
             applied_tags=self._tag(tag_name),
         )
         await created.message.edit(view=MarketplaceListingPostView(self))
-        await self.data.create_listing(created.thread.id, interaction.user.id, kind)
-        await interaction.followup.send(
-            f"✅ Veröffentlicht: {created.thread.mention}", ephemeral=True
+        await self.data.create_listing(
+            created.thread.id, interaction.user.id, kind, character_key
         )
+        reply = f"✅ Veröffentlicht: {created.thread.mention}"
+        if edit:
+            await interaction.edit_original_response(content=reply)
+        else:
+            await interaction.followup.send(reply, ephemeral=True)
 
     async def mark_listing_done(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
@@ -285,6 +373,31 @@ class MarketplaceCog(ManagedTaskCog):
         result = await wow.search_crafting_by_item_id(item_id)
         await self._route_search_result(interaction, result, note, edit=True)
 
+    async def begin_crafting_request_from_result(
+        self,
+        interaction: discord.Interaction,
+        result: "CraftingSearchResult",
+        note: str | None,
+    ) -> None:
+        """Entry point from the EXISTING /wow crafting search's own result
+        (via the "Marktplatz-Anfrage erstellen" button) - the item is
+        already resolved, so this skips straight to picking the requesting
+        character. Only ever called for an already-"ok"/"no_crafter"/
+        "manual_recipe" result (see WoWCog.crafting_search_response_view)."""
+        wow = self.wow
+        if wow is None:
+            await interaction.response.edit_message(
+                content="❌ System aktuell nicht verfügbar.", view=None
+            )
+            return
+        # edit=True: the button's own interaction originates from the
+        # existing ephemeral search-result message (a private message
+        # already owned by this user) - edit it in place rather than
+        # stacking a new ephemeral message on top of it.
+        await self._pick_requesting_character_and_finish(
+            interaction, result, note, wow, edit=True
+        )
+
     async def _route_search_result(
         self,
         interaction: discord.Interaction,
@@ -329,13 +442,62 @@ class MarketplaceCog(ManagedTaskCog):
         wow = self.wow
         if wow is None:  # pragma: no cover - defensive, checked by callers already
             return
-        if edit:
-            await interaction.response.edit_message(
+        await self._pick_requesting_character_and_finish(
+            interaction, result, note, wow, edit=edit
+        )
+
+    async def _pick_requesting_character_and_finish(
+        self,
+        interaction: discord.Interaction,
+        result: "CraftingSearchResult",
+        note: str | None,
+        wow: "WoWCog",
+        *,
+        edit: bool,
+    ) -> None:
+        """Which claimed char needs this, before actually creating the post
+        — skipped automatically if the user only has one claim. Also gates
+        out anyone without a single claimed char at all."""
+        claims = await wow.data.claims_for_user(interaction.user.id)
+        if not claims:
+            msg = (
+                "Du brauchst mindestens einen geclaimten Char, um hier "
+                "mitzumachen. Nutze zuerst `/wow claim`."
+            )
+            if edit:
+                await interaction.response.edit_message(content=msg, view=None)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+        if len(claims) == 1:
+            if edit:
+                await interaction.response.edit_message(
+                    content="⏳ Erstelle Marktplatz-Post ...", view=None
+                )
+            else:
+                await interaction.response.defer(ephemeral=True)
+            await self._finish_crafting_request(
+                interaction, result, note, wow, claims[0].character_key, edit=edit
+            )
+            return
+
+        async def on_selected(
+            picker_interaction: discord.Interaction, character_key: str
+        ) -> None:
+            await picker_interaction.response.edit_message(
                 content="⏳ Erstelle Marktplatz-Post ...", view=None
             )
+            await self._finish_crafting_request(
+                picker_interaction, result, note, wow, character_key, edit=True
+            )
+
+        choices = [(c.character_key, c.character_name) for c in claims]
+        view = MarketplaceCharacterSelectView(interaction.user.id, choices, on_selected)
+        content = "Welcher Char sucht das?"
+        if edit:
+            await interaction.response.edit_message(content=content, view=view)
         else:
-            await interaction.response.defer(ephemeral=True)
-        await self._finish_crafting_request(interaction, result, note, wow, edit=edit)
+            await interaction.response.send_message(content, view=view, ephemeral=True)
 
     async def _finish_crafting_request(
         self,
@@ -343,6 +505,7 @@ class MarketplaceCog(ManagedTaskCog):
         result: "CraftingSearchResult",
         note: str | None,
         wow: "WoWCog",
+        character_key: str,
         *,
         edit: bool,
     ) -> None:
@@ -357,11 +520,12 @@ class MarketplaceCog(ManagedTaskCog):
 
         item_name = wow._localized_text((result.item or {}).get("name")) or "?"
         item_key = self._item_key_for_result(result)
+        label = await wow.character_display_label(character_key)
         thread_name = f"🛠️ {item_name} gesucht"[:100]
         body_lines = [f"**Item:** {item_name}"]
         if note:
             body_lines.append(f"**Notiz:** {note}")
-        body_lines.append(f"\nGesucht von <@{interaction.user.id}>")
+        body_lines.append(f"\nGesucht von {label}")
 
         created = await forum.create_thread(
             name=thread_name,
@@ -370,7 +534,11 @@ class MarketplaceCog(ManagedTaskCog):
         )
         await created.message.edit(view=MarketplaceCraftingPostView(self))
         await self.data.create_crafting_request(
-            created.thread.id, interaction.user.id, item_name, item_key
+            created.thread.id,
+            interaction.user.id,
+            item_name,
+            item_key,
+            character_key,
         )
 
         crafters = await self._filter_notify_opt_in(result.crafters or [])
@@ -462,6 +630,49 @@ class MarketplaceCog(ManagedTaskCog):
 # --------------------------------------------------------------------------- #
 
 
+class MarketplaceCharacterSelect(discord.ui.Select):
+    def __init__(self, parent: "MarketplaceCharacterSelectView") -> None:
+        self.parent_view = parent
+        options = [
+            discord.SelectOption(label=label[:100], value=key)
+            for key, label in parent.choices[:25]
+        ]
+        super().__init__(
+            placeholder="Char auswählen", min_values=1, max_values=1, options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.on_selected(interaction, self.values[0])
+
+
+class MarketplaceCharacterSelectView(discord.ui.View):
+    """Reusable 'which of my claimed chars' picker, shared by the generic
+    listing flow and the crafting-gesuch flow. ``on_selected`` is an async
+    callable ``(interaction, character_key) -> None`` supplied by the caller
+    - each flow closes over whatever else it still needs (title/description,
+    or the resolved search result) rather than this view knowing about it."""
+
+    def __init__(
+        self,
+        owner_user_id: int,
+        choices: list[tuple[str, str]],
+        on_selected: Callable[[discord.Interaction, str], Awaitable[None]],
+    ) -> None:
+        super().__init__(timeout=180)
+        self.owner_user_id = owner_user_id
+        self.choices = choices
+        self.on_selected = on_selected
+        self.add_item(MarketplaceCharacterSelect(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+        await interaction.response.send_message(
+            "Diese Auswahl gehört nicht dir.", ephemeral=True
+        )
+        return False
+
+
 class MarketplaceHubView(discord.ui.View):
     """Persistent buttons on the pinned hub post."""
 
@@ -544,7 +755,7 @@ class MarketplaceListingModal(discord.ui.Modal):
         self.add_item(self.description_input)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.cog.publish_listing(
+        await self.cog.choose_character_for_listing(
             interaction,
             self.kind,
             str(self.title_input.value),

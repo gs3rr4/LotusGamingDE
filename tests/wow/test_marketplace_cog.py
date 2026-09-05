@@ -13,14 +13,18 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
+from lotus_bot.cogs.wow.cog import MEMBER_RANK, TWINK_RANK, WoWCog
 from lotus_bot.cogs.wow.data import RosterMember, WoWData
-from lotus_bot.cogs.wow.marketplace_cog import MarketplaceCog
+from lotus_bot.cogs.wow.marketplace_cog import (
+    MarketplaceCog,
+    MarketplaceCharacterSelectView,
+)
 from lotus_bot.cogs.wow.marketplace_data import MarketplaceData
 
 pytestmark = pytest.mark.asyncio
 
 
-def roster_member(name, key):
+def roster_member(name, key, guild_rank=1):
     return RosterMember(
         character_key=key,
         character_id=1,
@@ -30,7 +34,49 @@ def roster_member(name, key):
         class_id=4,
         race_id=8,
         faction="HORDE",
-        guild_rank=1,
+        guild_rank=guild_rank,
+    )
+
+
+def make_real_wow(wow_data: WoWData) -> WoWCog:
+    """A real WoWCog instance backed by ``wow_data``, without running its
+    heavy __init__ (no bot needed) - character_display_label/_localized_text
+    are pure functions of self.data, so this exercises the REAL logic."""
+    wow = WoWCog.__new__(WoWCog)
+    wow.data = wow_data
+    return wow
+
+
+class FakeCreatedThread:
+    def __init__(self, thread):
+        self.thread = thread
+        self.message = MagicMock()
+        self.message.edit = AsyncMock()
+
+
+class FakeForum:
+    def __init__(self):
+        self.created: list[dict] = []
+        self._next_id = 900
+
+    async def create_thread(self, *, name, content=None, embed=None, applied_tags=None):
+        self._next_id += 1
+        thread = make_thread(self._next_id)
+        self.created.append(
+            {"name": name, "content": content, "applied_tags": applied_tags}
+        )
+        return FakeCreatedThread(thread)
+
+
+def make_result(item_id="item.1", item_name="Testitem", crafters=None, status="ok"):
+    return SimpleNamespace(
+        status=status,
+        item={"id": item_id, "name": {"de": item_name, "en": item_name}},
+        recipe={},
+        crafters=crafters or [],
+        required_skill=0,
+        profession_id=None,
+        manual_recipe=False,
     )
 
 
@@ -73,11 +119,15 @@ def make_thread(thread_id):
     return thread
 
 
-def make_interaction(user_id, channel):
+def make_interaction(user_id, channel=None):
     interaction = MagicMock()
     interaction.user.id = user_id
     interaction.channel = channel
     interaction.response.send_message = AsyncMock()
+    interaction.response.edit_message = AsyncMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
     return interaction
 
 
@@ -155,3 +205,99 @@ async def test_mark_listing_done_only_for_poster(tmp_path):
     await cog.mark_listing_done(poster)
     assert (await cog.data.get_listing(222)).status == "done"
     thread.edit.assert_awaited_once()
+
+
+async def test_choose_character_for_listing_rejects_without_any_claim(tmp_path):
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    cog.forum = lambda: FakeForum()  # never reached - the claim gate blocks first
+
+    interaction = make_interaction(42)
+    await cog.choose_character_for_listing(interaction, "biete", "Titel", "")
+
+    assert "geclaimten Char" in interaction.response.send_message.await_args.args[0]
+    await wow_data.close()
+
+
+async def test_choose_character_for_listing_single_claim_shows_relation_label(
+    tmp_path,
+):
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    # A lone Twink with no Member+ owner - relation shown without "von X".
+    solo = roster_member("Weedlager", "id:3", guild_rank=TWINK_RANK)
+    await wow_data.replace_snapshot([solo])
+    await wow_data.create_claim(solo, 99)
+
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    fake_forum = FakeForum()
+    cog.forum = lambda: fake_forum
+
+    interaction = make_interaction(99)
+    await cog.choose_character_for_listing(interaction, "biete", "Ausruestung", "Test")
+
+    assert fake_forum.created[0]["content"].endswith("Angebot von Weedlager (Twink)")
+    listing = await cog.data.get_listing(901)
+    assert listing is not None
+    assert listing.character_key == "id:3"
+    interaction.followup.send.assert_awaited_once()
+    await wow_data.close()
+
+
+async def test_choose_character_for_listing_multiple_claims_shows_picker(tmp_path):
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    main_char = roster_member("Lyxendra", "id:1", guild_rank=MEMBER_RANK)
+    twink = roster_member("Voidok", "id:2", guild_rank=TWINK_RANK)
+    await wow_data.replace_snapshot([main_char, twink])
+    await wow_data.create_claim(main_char, 42)
+    await wow_data.create_claim(twink, 42)
+
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    fake_forum = FakeForum()
+    cog.forum = lambda: fake_forum
+
+    interaction = make_interaction(42)
+    await cog.choose_character_for_listing(interaction, "suche", "Hilfe", "")
+
+    # No thread yet - the picker must appear first.
+    assert fake_forum.created == []
+    _, kwargs = interaction.response.send_message.await_args
+    view = kwargs["view"]
+    assert isinstance(view, MarketplaceCharacterSelectView)
+    assert {key for key, _ in view.choices} == {"id:1", "id:2"}
+
+    # Simulate picking the Twink: the thread now shows the relation label.
+    picker_interaction = make_interaction(42)
+    await view.on_selected(picker_interaction, "id:2")
+
+    assert fake_forum.created[0]["content"].endswith(
+        "Gesuch von Voidok (Twink von Lyxendra)"
+    )
+    await wow_data.close()
+
+
+async def test_finish_crafting_request_stores_character_and_label(tmp_path):
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    main_char = roster_member("Lyxendra", "id:1", guild_rank=MEMBER_RANK)
+    await wow_data.replace_snapshot([main_char])
+    await wow_data.create_claim(main_char, 42)
+
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    fake_forum = FakeForum()
+    cog.forum = lambda: fake_forum
+
+    interaction = make_interaction(42)
+    result = make_result(item_id="item.9", item_name="Wuttrank")
+    await cog._finish_crafting_request(
+        interaction, result, "bringe Mats mit", wow, "id:1", edit=False
+    )
+
+    request = await cog.data.get_crafting_request(901)
+    assert request.requester_character_key == "id:1"
+    assert "Gesucht von Lyxendra" in fake_forum.created[0]["content"]
+    assert "bringe Mats mit" in fake_forum.created[0]["content"]
+    interaction.followup.send.assert_awaited_once()
+    await wow_data.close()

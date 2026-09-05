@@ -1546,6 +1546,57 @@ class WoWCog(ManagedTaskCog):
         get_cog = getattr(self.bot, "get_cog", None)
         return get_cog("DuoCog") if get_cog else None
 
+    def _marketplace_cog(self):
+        get_cog = getattr(self.bot, "get_cog", None)
+        return get_cog("MarketplaceCog") if get_cog else None
+
+    async def character_display_label(self, character_key: str) -> str:
+        """Name + guild-role context, e.g. "Voidok (Twink von Lyxendra)" for
+        a Bank/Twink char, or just the plain name for a Main/Officer/etc.
+
+        Used wherever a character is attributed for a reader who doesn't
+        necessarily know the guild roster (e.g. Marketplace posts) — shows
+        who to actually message, not just an anonymous Discord mention.
+        "Main" is the same "Member+ but not the sanctioned Officer-Twink"
+        rule ``build_sync_report`` already uses for the main-slot check.
+        """
+        claim = await self.data.get_claim(character_key)
+        if claim is None:
+            return character_key
+        snapshot = await self.data.get_snapshot()
+        member = snapshot.get(character_key)
+        if member is None or member.guild_rank not in (BANK_RANK, TWINK_RANK):
+            return claim.character_name
+
+        relation = "Bank" if member.guild_rank == BANK_RANK else "Twink"
+        siblings = await self.data.claims_for_user(claim.discord_user_id)
+        main_candidates = [
+            sib_member
+            for sibling in siblings
+            if (sib_member := snapshot.get(sibling.character_key)) is not None
+            and sib_member.guild_rank <= MEMBER_RANK
+            and sib_member.guild_rank != OFFICER_TWINK_RANK
+        ]
+        if not main_candidates:
+            return f"{claim.character_name} ({relation})"
+        main = min(main_candidates, key=lambda m: m.guild_rank)
+        return f"{claim.character_name} ({relation} von {main.name})"
+
+    def crafting_search_response_view(
+        self, result: CraftingSearchResult, owner_user_id: int
+    ) -> discord.ui.View | None:
+        """The optional follow-up view for a crafting-search result: the
+        item-disambiguation picker, or a "Marktplatz-Anfrage erstellen"
+        bridge button for a resolved result. ``None`` for not-found statuses.
+        """
+        if result.status == "ambiguous_item":
+            return CraftingSearchSuggestionView(
+                self, owner_user_id, result.candidates or []
+            )
+        if result.status in ("ok", "no_crafter", "manual_recipe"):
+            return CraftingSearchMarketplaceActionsView(self, owner_user_id, result)
+        return None
+
     async def _notify_duo_milestone(self, milestone: Milestone) -> None:
         """Fire-and-forget: let the Duo cog celebrate a team level-milestone."""
         duo = self._duo_cog()
@@ -3817,9 +3868,12 @@ class CraftingSearchSuggestionSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         result = await self.parent_view.cog.search_crafting_by_item_id(self.values[0])
+        view = self.parent_view.cog.crafting_search_response_view(
+            result, interaction.user.id
+        )
         await interaction.response.edit_message(
             content=self.parent_view.cog.format_crafting_search_result(result),
-            view=None,
+            view=view,
         )
 
 
@@ -3838,6 +3892,43 @@ class CraftingSearchSuggestionView(discord.ui.View):
             "Diese Auswahl gehört nicht dir.", ephemeral=True
         )
         return False
+
+
+class CraftingSearchMarketplaceActionsView(discord.ui.View):
+    """Bridges an already-resolved crafting search into a Marktplatz
+    Crafting-Gesuch, so the item never needs to be re-typed/re-searched."""
+
+    def __init__(
+        self, cog: WoWCog, owner_user_id: int, result: CraftingSearchResult
+    ) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.owner_user_id = owner_user_id
+        self.result = result
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_user_id:
+            return True
+        await interaction.response.send_message("Das gehört nicht dir.", ephemeral=True)
+        return False
+
+    @discord.ui.button(
+        label="Marktplatz-Anfrage erstellen",
+        style=discord.ButtonStyle.success,
+        emoji="🛒",
+    )
+    async def create_request(
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        marketplace = self.cog._marketplace_cog()
+        if marketplace is None:
+            await interaction.response.send_message(
+                "❌ Marktplatz-System nicht verfügbar.", ephemeral=True
+            )
+            return
+        await marketplace.begin_crafting_request_from_result(
+            interaction, self.result, note=None
+        )
 
 
 def _recipe_selection_content(
@@ -4211,14 +4302,12 @@ class PanelCraftingSearchModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         result = await self.cog.search_crafting(str(self.item.value).strip())
         content = self.cog.format_crafting_search_result(result)
+        view = self.cog.crafting_search_response_view(result, interaction.user.id)
         # discord.py's send_message uses MISSING as the "no view" sentinel
         # and does ``not view.is_finished()`` on whatever else is passed —
         # explicitly passing ``view=None`` raises AttributeError. Only
         # forward ``view=...`` when we actually have a View instance.
-        if result.status == "ambiguous_item":
-            view = CraftingSearchSuggestionView(
-                self.cog, interaction.user.id, result.candidates or []
-            )
+        if view is not None:
             await interaction.response.send_message(content, view=view, ephemeral=True)
         else:
             await interaction.response.send_message(content, ephemeral=True)

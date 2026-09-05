@@ -7,7 +7,6 @@ from lotus_bot.permissions import moderator_only
 from .cog import (
     CraftingProfessionSelectView,
     CraftingRecipeSelectionView,
-    CraftingSearchSuggestionView,
     WoWCog,
 )
 from .data import CharacterClaim, CharacterKnownRecipe, CharacterProfession
@@ -1211,13 +1210,9 @@ async def crafting_search(interaction: discord.Interaction, item: str):
         return
 
     result = await cog.search_crafting(item)
-    view = None
-    if getattr(result, "status", "") == "ambiguous_item":
-        view = CraftingSearchSuggestionView(
-            cog, interaction.user.id, result.candidates or []
-        )
-    await interaction.response.send_message(
-        cog.format_crafting_search_result(result),
-        view=view,
-        ephemeral=True,
-    )
+    view = cog.crafting_search_response_view(result, interaction.user.id)
+    content = cog.format_crafting_search_result(result)
+    if view is not None:
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(content, ephemeral=True)

@@ -147,6 +147,9 @@ class DummyCog:
     def format_crafting_search_result(self, result):
         return result.message
 
+    def crafting_search_response_view(self, result, owner_user_id):
+        return None
+
     def _format_roster_line(self, member, level=None):
         lvl = level or member.level
         return f"**{member.name}**, Level **{lvl}**"

@@ -196,6 +196,7 @@ def member(
     class_id=4,
     race_id=8,
     is_ghost=False,
+    guild_rank=1,
 ):
     return RosterMember(
         character_key=key,
@@ -206,7 +207,7 @@ def member(
         class_id=class_id,
         race_id=race_id,
         faction="HORDE",
-        guild_rank=1,
+        guild_rank=guild_rank,
         is_ghost=is_ghost,
     )
 
@@ -1196,6 +1197,87 @@ async def test_panel_crafting_search_modal_uses_search(tmp_path, patch_logged_ta
 
 
 @pytest.mark.asyncio
+async def test_character_display_label_plain_for_main(tmp_path, patch_logged_task):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    main_char = member(key="id:1", name="Lyxendra", guild_rank=wow_cog_mod.MEMBER_RANK)
+    await cog.data.replace_snapshot([main_char])
+    await cog.data.create_claim(main_char, 42)
+
+    assert await cog.character_display_label("id:1") == "Lyxendra"
+
+
+@pytest.mark.asyncio
+async def test_character_display_label_shows_relation_for_twink_and_bank(
+    tmp_path, patch_logged_task
+):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    main_char = member(key="id:1", name="Lyxendra", guild_rank=wow_cog_mod.MEMBER_RANK)
+    twink = member(key="id:2", name="Voidok", guild_rank=wow_cog_mod.TWINK_RANK)
+    bank = member(key="id:3", name="Weedlager", guild_rank=wow_cog_mod.BANK_RANK)
+    await cog.data.replace_snapshot([main_char, twink, bank])
+    await cog.data.create_claim(main_char, 42)
+    await cog.data.create_claim(twink, 42)
+    await cog.data.create_claim(bank, 42)
+
+    assert await cog.character_display_label("id:2") == "Voidok (Twink von Lyxendra)"
+    assert await cog.character_display_label("id:3") == "Weedlager (Bank von Lyxendra)"
+
+
+@pytest.mark.asyncio
+async def test_character_display_label_omits_relation_when_no_main_found(
+    tmp_path, patch_logged_task
+):
+    """A Twink whose owner has no Member+ char (the 'no_main_users' case) -
+    show the plain relation without a dangling 'von' clause."""
+    cog = await create_cog(tmp_path, patch_logged_task)
+    twink = member(key="id:2", name="Voidok", guild_rank=wow_cog_mod.TWINK_RANK)
+    await cog.data.replace_snapshot([twink])
+    await cog.data.create_claim(twink, 42)
+
+    assert await cog.character_display_label("id:2") == "Voidok (Twink)"
+
+
+@pytest.mark.asyncio
+async def test_character_display_label_officer_twink_not_treated_as_main(
+    tmp_path, patch_logged_task
+):
+    """Officer Twink is a sanctioned SECOND high-rank char, not a 'Main' -
+    a Bank/Twink char's relation must not attribute to it."""
+    cog = await create_cog(tmp_path, patch_logged_task)
+    officer_twink = member(
+        key="id:1", name="Zweitoffi", guild_rank=wow_cog_mod.OFFICER_TWINK_RANK
+    )
+    bank = member(key="id:2", name="Weedlager", guild_rank=wow_cog_mod.BANK_RANK)
+    await cog.data.replace_snapshot([officer_twink, bank])
+    await cog.data.create_claim(officer_twink, 42)
+    await cog.data.create_claim(bank, 42)
+
+    assert await cog.character_display_label("id:2") == "Weedlager (Bank)"
+
+
+def test_crafting_search_response_view_maps_statuses():
+    cog = wow_cog_mod.WoWCog.__new__(wow_cog_mod.WoWCog)  # no __init__ needed here
+    ambiguous = type("R", (), {"status": "ambiguous_item", "candidates": []})()
+    ok = type("R", (), {"status": "ok"})()
+    no_crafter = type("R", (), {"status": "no_crafter"})()
+    not_found = type("R", (), {"status": "item_not_found"})()
+
+    assert isinstance(
+        cog.crafting_search_response_view(ambiguous, 42),
+        wow_cog_mod.CraftingSearchSuggestionView,
+    )
+    assert isinstance(
+        cog.crafting_search_response_view(ok, 42),
+        wow_cog_mod.CraftingSearchMarketplaceActionsView,
+    )
+    assert isinstance(
+        cog.crafting_search_response_view(no_crafter, 42),
+        wow_cog_mod.CraftingSearchMarketplaceActionsView,
+    )
+    assert cog.crafting_search_response_view(not_found, 42) is None
+
+
+@pytest.mark.asyncio
 async def test_crafting_search_suggestion_select_runs_selected_search(
     tmp_path, patch_logged_task
 ):
@@ -1216,7 +1298,12 @@ async def test_crafting_search_suggestion_select_runs_selected_search(
     await select.callback(interaction)
 
     assert "kann gecraftet werden" in interaction.response.edits[0]["content"]
-    assert interaction.response.edits[0]["view"] is None
+    # A resolved ("ok") result now carries the Marktplatz-bridge button
+    # instead of no view - it's no longer just informational text.
+    assert isinstance(
+        interaction.response.edits[0]["view"],
+        wow_cog_mod.CraftingSearchMarketplaceActionsView,
+    )
 
 
 @pytest.mark.asyncio
@@ -3326,10 +3413,8 @@ async def test_reroll_after_death_can_claim_same_name(tmp_path, patch_logged_tas
 async def test_panel_crafting_search_modal_handles_unambiguous_match(
     tmp_path, patch_logged_task
 ):
-    """Regression: send_message(..., view=None) raises AttributeError inside
-    discord.py — that's the production crash we hit ~6× the week of 15. May.
-    For unambiguous matches we must omit ``view`` entirely.
-    """
+    """An unambiguous match now carries the "Marktplatz-Anfrage erstellen"
+    bridge button (not plain informational text anymore)."""
     cog = await create_cog(tmp_path, patch_logged_task)
     cog.bot.data = {"wow": crafting_data()}
     voidok = member(name="Voidok")
@@ -3342,13 +3427,38 @@ async def test_panel_crafting_search_modal_handles_unambiguous_match(
     modal.item._value = "Swiftnesstrank"
     interaction = DummyReviewInteraction(DummyUser(42))
 
-    # Would have raised AttributeError before the fix.
     await modal.on_submit(interaction)
 
     assert len(interaction.response.messages) == 1
     msg, kwargs = interaction.response.messages[0]
     assert "Swiftnesstrank" in msg
-    # The crash was caused by passing view=None; the fix must omit it.
+    assert isinstance(
+        kwargs.get("view"), wow_cog_mod.CraftingSearchMarketplaceActionsView
+    )
+    assert kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_panel_crafting_search_modal_omits_view_when_none(
+    tmp_path, patch_logged_task
+):
+    """Regression: send_message(..., view=None) raises AttributeError inside
+    discord.py — that's the production crash we hit ~6× the week of 15. May.
+    For statuses with no follow-up view (e.g. item not found) we must omit
+    ``view`` entirely rather than pass an explicit ``None``.
+    """
+    cog = await create_cog(tmp_path, patch_logged_task)
+    cog.bot.data = {"wow": crafting_data()}
+
+    modal = wow_cog_mod.PanelCraftingSearchModal(cog)
+    modal.item._value = "Voidobsoluteradnonsenseitem"
+    interaction = DummyReviewInteraction(DummyUser(42))
+
+    # Would have raised AttributeError before the fix.
+    await modal.on_submit(interaction)
+
+    assert len(interaction.response.messages) == 1
+    _, kwargs = interaction.response.messages[0]
     assert "view" not in kwargs
     assert kwargs.get("ephemeral") is True
 

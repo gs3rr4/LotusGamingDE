@@ -35,6 +35,7 @@ class CharacterClaim:
     verified_at: str | None
     verified_by: int | None
     review_message_id: int | None
+    crafting_notify: bool = True
 
 
 @dataclass
@@ -323,6 +324,12 @@ class WoWData:
         await self._ensure_column("gear_milestone_events", "awarded_at", "TEXT")
         await self._ensure_column(
             "roster_snapshot", "is_ghost", "INTEGER NOT NULL DEFAULT 0"
+        )
+        # Default ON (opt-out): the guild lead wants max discoverability for
+        # the Marketplace crafting-ping feature - SQLite backfills existing
+        # rows to 1 automatically, no separate migration needed.
+        await self._ensure_column(
+            "character_claims", "crafting_notify", "INTEGER NOT NULL DEFAULT 1"
         )
         # Seed the digest baseline from the existing live snapshot exactly once,
         # on upgrade of a database that predates the baseline table. Without this
@@ -705,7 +712,8 @@ class WoWData:
         cur = await db.execute(
             """
             SELECT character_key, character_name, realm_slug, discord_user_id, status,
-                   claimed_at, verified_at, verified_by, review_message_id
+                   claimed_at, verified_at, verified_by, review_message_id,
+                   crafting_notify
               FROM character_claims
              WHERE character_key = ?
             """,
@@ -729,7 +737,7 @@ class WoWData:
             """
             SELECT c.character_key, c.character_name, c.realm_slug, c.discord_user_id,
                    c.status, c.claimed_at, c.verified_at, c.verified_by,
-                   c.review_message_id
+                   c.review_message_id, c.crafting_notify
               FROM character_claims c
               LEFT JOIN roster_snapshot rs ON rs.character_key = c.character_key
               LEFT JOIN death_events d ON d.character_key = c.character_key
@@ -804,6 +812,36 @@ class WoWData:
         )
         await db.commit()
 
+    async def set_crafting_notify(self, character_key: str, enabled: bool) -> None:
+        await self.init_db()
+        db = await self._get_db()
+        await db.execute(
+            "UPDATE character_claims SET crafting_notify = ? WHERE character_key = ?",
+            (int(bool(enabled)), character_key),
+        )
+        await db.commit()
+
+    async def crafting_notify_map(self, character_keys: list[str]) -> dict[str, bool]:
+        """Batch lookup for the Marketplace ping filter - one query, not N+1.
+
+        Keys not present in ``character_claims`` (shouldn't normally happen
+        for a claimed char, but be defensive) are simply absent from the
+        result; callers should default to ``True`` (opt-out semantics) via
+        ``.get(key, True)``.
+        """
+        if not character_keys:
+            return {}
+        await self.init_db()
+        db = await self._get_db()
+        placeholders = ",".join("?" for _ in character_keys)
+        cur = await db.execute(
+            f"SELECT character_key, crafting_notify FROM character_claims "
+            f"WHERE character_key IN ({placeholders})",
+            character_keys,
+        )
+        rows = await cur.fetchall()
+        return {row[0]: bool(row[1]) for row in rows}
+
     async def get_claim_by_review_message(
         self, review_message_id: int
     ) -> CharacterClaim | None:
@@ -812,7 +850,8 @@ class WoWData:
         cur = await db.execute(
             """
             SELECT character_key, character_name, realm_slug, discord_user_id, status,
-                   claimed_at, verified_at, verified_by, review_message_id
+                   claimed_at, verified_at, verified_by, review_message_id,
+                   crafting_notify
               FROM character_claims
              WHERE review_message_id = ?
             """,
@@ -843,7 +882,8 @@ class WoWData:
         cur = await db.execute(
             """
             SELECT character_key, character_name, realm_slug, discord_user_id, status,
-                   claimed_at, verified_at, verified_by, review_message_id
+                   claimed_at, verified_at, verified_by, review_message_id,
+                   crafting_notify
               FROM character_claims
              WHERE discord_user_id = ?
              ORDER BY lower(character_name)
@@ -858,7 +898,8 @@ class WoWData:
         db = await self._get_db()
         query = """
             SELECT character_key, character_name, realm_slug, discord_user_id, status,
-                   claimed_at, verified_at, verified_by, review_message_id
+                   claimed_at, verified_at, verified_by, review_message_id,
+                   crafting_notify
               FROM character_claims
         """
         params: tuple[str, ...] = ()
@@ -1813,6 +1854,7 @@ def _claim_from_row(row: tuple[Any, ...]) -> CharacterClaim:
         claimed_at=row[5],
         verified_at=row[6],
         verified_by=row[7],
+        crafting_notify=bool(row[9]) if len(row) > 9 else True,
         review_message_id=row[8],
     )
 

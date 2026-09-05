@@ -1,3 +1,6 @@
+import base64
+import json
+
 import pytest
 import discord
 import pytest_asyncio
@@ -952,6 +955,37 @@ async def test_my_chars_release_drops_claim_and_refreshes(tmp_path, patch_logged
     assert interaction.response.edits, "release should refresh the view"
     refreshed_embed = interaction.response.edits[0]["embed"]
     assert "noch keinen" in refreshed_embed.description
+
+
+@pytest.mark.asyncio
+async def test_my_chars_notify_toggle_flips_flag_and_button_label(
+    tmp_path, patch_logged_task
+):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    voidok = member(name="Voidok")
+    await cog.data.replace_snapshot([voidok])
+    claim, _ = await cog.data.create_claim(voidok, 42)
+    assert claim.crafting_notify is True  # default ON (opt-out)
+
+    view = wow_cog_mod.PanelMyCharsView(cog, owner_user_id=42)
+    interaction = DummyReviewInteraction(DummyUser(42))
+    await view.send(interaction)
+    labels = [c.label for c in view.children if isinstance(c, discord.ui.Button)]
+    assert "🔕 Crafting-Anfragen aus" in labels
+
+    await cog._my_chars_notify_toggle(interaction, view)
+
+    assert (await cog.data.get_claim(claim.character_key)).crafting_notify is False
+    refreshed_labels = [
+        c.label for c in view.children if isinstance(c, discord.ui.Button)
+    ]
+    # The relies-on-fresh-object _load() fix: without it, this button would
+    # still read "aus" here since the view would keep the stale pre-toggle
+    # claim object even though the DB flag flipped.
+    assert "🔔 Crafting-Anfragen an" in refreshed_labels
+
+    await cog._my_chars_notify_toggle(interaction, view)
+    assert (await cog.data.get_claim(claim.character_key)).crafting_notify is True
 
 
 @pytest.mark.asyncio
@@ -1987,6 +2021,138 @@ async def test_recipe_selection_view_saves_multiple_recipes(
 
     assert await cog.data.known_recipe_spell_ids(claim.character_key) == {"spell.2335"}
     assert "1 Rezepte" in interaction.response.edits[0]["content"]
+
+
+def _build_addon_export(character: str, professions: list[dict]) -> str:
+    """Build a LotusDiscordBridge-shaped export code, mirroring the addon's
+    own JSON+base64 envelope, for exercising import_profession_export()."""
+    payload = {
+        "character": character,
+        "version": 1,
+        "addon": "LotusDiscordBridge",
+        "exportedAt": 1,
+        "realm": "Soulseeker",
+        "data": {"professions": professions},
+    }
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+@pytest.mark.asyncio
+async def test_import_profession_export_success(tmp_path, patch_logged_task):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    cog.bot.data = {"wow": crafting_data()}
+    await cog.data.replace_snapshot([member(name="Voidok")])
+    claim, _ = await cog.data.create_claim(member(name="Voidok"), 42)
+
+    profession = {
+        "professionId": "alchemy",
+        "name": "Alchemy",
+        "skillLevel": 75,
+        "maxSkillLevel": 300,
+        "recipes": [
+            # Trainer recipes - only update character_professions.skill_level
+            # (existing table), never character_known_recipes: the crafter
+            # search already finds these dynamically via required_skill.
+            {"name": "Minor Healing Potion", "itemId": 118, "idSource": "item"},
+            {"name": "Minor Mana Potion", "itemId": 999, "idSource": "item"},
+            # Non-trainer, hardcore_valid - IS points-eligible, goes into
+            # the existing character_known_recipes (same table manual
+            # curation writes to).
+            {"name": "Swiftness Potion", "itemId": 2459, "idSource": "item"},
+            # Not in our Wowhead data at all - must be logged as unmatched,
+            # never silently dropped.
+            {"name": "Totally Unknown Thing", "itemId": 424242, "idSource": "item"},
+        ],
+    }
+    code = _build_addon_export("Voidok", [profession])
+
+    result = await cog.import_profession_export(42, code)
+
+    assert result.status == "ok"
+    assert result.professions_imported == 1
+    assert result.recipes_seen == 4
+    assert result.special_recipes_learned == 1
+    assert result.unmatched == [
+        "alchemy: Totally Unknown Thing (item=424242, spell=None)"
+    ]
+
+    profile = await cog.data.get_character_profession(claim.character_key, "alchemy")
+    assert profile.skill_level == 75
+
+    # Only the non-trainer recipe feeds the existing points system.
+    assert await cog.data.known_recipe_spell_ids(claim.character_key) == {"spell.2335"}
+
+    # No new/redundant storage: the EXISTING crafter search must find this
+    # character for both a trainer recipe (via skill_level) and the special
+    # recipe (via character_known_recipes), completely unchanged.
+    await cog.data.verify_claim(claim.character_key, 99)
+    trainer_search = await cog.search_crafting_by_item_id("item.118")
+    assert trainer_search.status == "ok"
+    assert trainer_search.crafters[0].character_name == "Voidok"
+
+    special_search = await cog.search_crafting_by_item_id("item.2459")
+    assert special_search.status == "ok"
+    assert special_search.crafters[0].character_name == "Voidok"
+
+
+@pytest.mark.asyncio
+async def test_import_profession_export_is_idempotent(tmp_path, patch_logged_task):
+    """Re-importing the same export twice must not duplicate points/events -
+    character_known_recipes already de-dupes via INSERT OR IGNORE."""
+    cog = await create_cog(tmp_path, patch_logged_task)
+    cog.bot.data = {"wow": crafting_data()}
+    claim, _ = await cog.data.create_claim(member(name="Voidok"), 42)
+
+    profession = {
+        "professionId": "alchemy",
+        "skillLevel": 75,
+        "recipes": [{"name": "Swiftness Potion", "itemId": 2459}],
+    }
+    code = _build_addon_export("Voidok", [profession])
+
+    first = await cog.import_profession_export(42, code)
+    second = await cog.import_profession_export(42, code)
+
+    assert first.special_recipes_learned == 1
+    assert second.special_recipes_learned == 0  # already known, not re-awarded
+    assert await cog.data.known_recipe_spell_ids(claim.character_key) == {"spell.2335"}
+
+    # A follow-up import with a higher skill level updates it in place - the
+    # existing character_professions upsert, unchanged.
+    profession["skillLevel"] = 150
+    await cog.import_profession_export(42, _build_addon_export("Voidok", [profession]))
+    profile = await cog.data.get_character_profession(claim.character_key, "alchemy")
+    assert profile.skill_level == 150
+
+
+@pytest.mark.asyncio
+async def test_import_profession_export_ownership_and_validation(
+    tmp_path, patch_logged_task
+):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    cog.bot.data = {"wow": crafting_data()}
+
+    # Malformed / non-addon codes are rejected, not raised as exceptions.
+    assert (await cog.import_profession_export(42, "not-valid-base64!!")).status == (
+        "invalid"
+    )
+    other_addon = base64.b64encode(json.dumps({"addon": "Other"}).encode()).decode()
+    assert (await cog.import_profession_export(42, other_addon)).status == "invalid"
+
+    profession = {"professionId": "alchemy", "skillLevel": 75, "recipes": []}
+    code = _build_addon_export("Ghostface", [profession])
+    assert (await cog.import_profession_export(42, code)).status == "not_claimed"
+
+    await cog.data.create_claim(member(name="Voidok"), 42)
+    code = _build_addon_export("Voidok", [])
+    assert (await cog.import_profession_export(42, code)).status == "no_professions"
+
+    code = _build_addon_export("Voidok", [profession])
+    forbidden = await cog.import_profession_export(999, code)
+    assert forbidden.status == "forbidden"
+    # A moderator may import on behalf of someone else's character.
+    as_mod = await cog.import_profession_export(999, code, is_mod=True)
+    assert as_mod.status == "ok"
 
 
 @pytest.mark.asyncio

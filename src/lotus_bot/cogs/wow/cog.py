@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import difflib
+import json
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -313,6 +316,33 @@ class RecipeSelectionResult:
     profiles: list[CharacterProfession] | None = None
     profile: CharacterProfession | None = None
     recipes: list[dict] | None = None
+
+
+@dataclass
+class ProfessionImportResult:
+    """Outcome of decoding + importing a LotusDiscordBridge addon export.
+
+    Deliberately writes to NO new storage: skill level goes into the
+    existing ``character_professions`` (the crafter search already reads
+    this for trainer recipes via required_skill), and only the subset of
+    imported recipes that also qualifies under the existing points-eligible
+    character_known_recipes rules (non-trainer, hardcore_valid) is recorded
+    there (the crafter search already reads this table for special recipes)
+    - importing never awards points beyond what manual recipe curation
+    already would, and the search command needs no changes at all.
+    ``recipes_seen`` is just the informational count of recipes the export
+    contained, for the confirmation message. ``unmatched`` lists recipes
+    that matched nothing in our Wowhead-sourced data at all, surfaced to the
+    caller; the same detail is always logged regardless.
+    """
+
+    status: str
+    claim: CharacterClaim | None = None
+    character_name: str | None = None
+    professions_imported: int = 0
+    recipes_seen: int = 0
+    special_recipes_learned: int = 0
+    unmatched: list[str] | None = None
 
 
 @dataclass
@@ -2221,6 +2251,18 @@ class WoWCog(ManagedTaskCog):
         view.selected_claim = None
         await view.refresh(interaction)
 
+    async def _my_chars_notify_toggle(
+        self, interaction: discord.Interaction, view: "PanelMyCharsView"
+    ) -> None:
+        claim = view.selected_claim
+        if claim is None:
+            await view.refresh(interaction)
+            return
+        await self.data.set_crafting_notify(
+            claim.character_key, not claim.crafting_notify
+        )
+        await view.refresh(interaction)
+
     async def _my_chars_claim_new(
         self, interaction: discord.Interaction, view: "PanelMyCharsView"
     ) -> None:
@@ -2948,6 +2990,173 @@ class WoWCog(ManagedTaskCog):
                     claim.character_key, spell_id, profession_id, rarity, points
                 )
         return len(inserted)
+
+    def _decode_profession_export(self, code: str) -> dict:
+        """Decode a LotusDiscordBridge addon export string (base64 -> JSON).
+
+        Raises ``ValueError`` with a user-facing message on any malformed
+        input - a truncated paste, wrong addon, or corrupted code should
+        never surface as a raw exception to the caller.
+        """
+        try:
+            raw = base64.b64decode(code.strip(), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Der Code ist kein gueltiger Export (Base64).") from exc
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Der Code enthaelt kein gueltiges Export-Format.") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("addon") != "LotusDiscordBridge"
+        ):
+            raise ValueError("Das ist kein LotusDiscordBridge-Export-Code.")
+        return payload
+
+    def _match_special_recipes(
+        self, profession_id: str, recipes: list[dict]
+    ) -> tuple[list[str], list[str]]:
+        """Cross-check imported recipes against our Wowhead-sourced data.
+
+        Returns ``(matched_spell_ids, unmatched_labels)``. A matched recipe
+        only ends up in ``matched_spell_ids`` (fed into the EXISTING
+        ``save_known_recipes`` points system) when it is non-trainer and
+        hardcore_valid - identical criteria to manual recipe curation, so
+        importing never awards more than picking recipes by hand would.
+        ``unmatched`` covers ids that exist in neither trainer nor special
+        recipe data for this profession at all - a real gap worth surfacing,
+        not just "this one happens to be an ordinary trainer recipe".
+        """
+        static_recipes = [
+            record
+            for record in self._wow_records("profession_recipes")
+            if record.get("profession_id") == profession_id
+        ]
+        by_item_id = {
+            record.get("creates_item_id"): record
+            for record in static_recipes
+            if record.get("creates_item_id")
+        }
+        by_spell_id = {
+            record.get("spell_id"): record
+            for record in static_recipes
+            if record.get("spell_id")
+        }
+
+        matched: list[str] = []
+        unmatched: list[str] = []
+        for recipe in recipes:
+            item_id = recipe.get("itemId")
+            spell_id = recipe.get("spellId")
+            static_recipe = None
+            if item_id is not None:
+                static_recipe = by_item_id.get(f"item.{item_id}")
+            if static_recipe is None and spell_id is not None:
+                static_recipe = by_spell_id.get(f"spell.{spell_id}")
+
+            if static_recipe is None:
+                unmatched.append(
+                    f"{recipe.get('name', '?')} (item={item_id}, spell={spell_id})"
+                )
+                continue
+            if static_recipe.get("learned_from") != "trainer" and static_recipe.get(
+                "hardcore_valid"
+            ):
+                matched.append(static_recipe.get("spell_id"))
+        return matched, unmatched
+
+    async def import_profession_export(
+        self,
+        discord_user_id: int,
+        code: str,
+        *,
+        is_mod: bool = False,
+    ) -> ProfessionImportResult:
+        """Import a LotusDiscordBridge addon export for the character it names.
+
+        Updates the character's skill level, replaces its full crafting-
+        recipe index (search data - see ``character_crafting_recipes``), and
+        feeds whatever qualifies as a points-eligible special recipe into
+        the existing ``save_known_recipes`` flow. Anything that matches
+        nothing in our static data is logged (never silently dropped) and
+        also returned so the caller can surface a count to the user.
+        """
+        try:
+            payload = self._decode_profession_export(code)
+        except ValueError as exc:
+            logger.warning("[WoWCog] Profession-Import abgelehnt: %s", exc)
+            return ProfessionImportResult("invalid")
+
+        character_name = payload.get("character")
+        claim = (
+            await self.data.get_claim_by_name(character_name)
+            if character_name
+            else None
+        )
+        if not claim:
+            return ProfessionImportResult("not_claimed", character_name=character_name)
+        if not is_mod and claim.discord_user_id != discord_user_id:
+            return ProfessionImportResult(
+                "forbidden", claim=claim, character_name=character_name
+            )
+
+        professions = (payload.get("data") or {}).get("professions") or []
+        if not professions:
+            return ProfessionImportResult(
+                "no_professions", claim=claim, character_name=character_name
+            )
+
+        recipes_seen = 0
+        special_learned = 0
+        unmatched: list[str] = []
+
+        for profession in professions:
+            profession_id = profession.get("professionId")
+            if not profession_id:
+                continue
+
+            skill_level = profession.get("skillLevel")
+            if isinstance(skill_level, int) and skill_level > 0:
+                # The crafter search already reads this table for trainer
+                # recipes (skill_level >= required_skill) - no separate
+                # storage needed for those.
+                await self.data.set_character_profession(
+                    claim, profession_id, skill_level
+                )
+
+            recipes = profession.get("recipes") or []
+            recipes_seen += len(recipes)
+
+            matched_spell_ids, profession_unmatched = self._match_special_recipes(
+                profession_id, recipes
+            )
+            for detail in profession_unmatched:
+                logger.warning(
+                    "[WoWCog] Profession-Import: kein DB-Treffer (char=%s, beruf=%s): %s",
+                    character_name,
+                    profession_id,
+                    detail,
+                )
+            unmatched.extend(
+                f"{profession_id}: {detail}" for detail in profession_unmatched
+            )
+
+            if matched_spell_ids:
+                # The crafter search already reads character_known_recipes
+                # for special recipes - same table manual curation writes to.
+                special_learned += await self.save_known_recipes(
+                    claim, profession_id, matched_spell_ids
+                )
+
+        return ProfessionImportResult(
+            "ok",
+            claim=claim,
+            character_name=character_name,
+            professions_imported=len(professions),
+            recipes_seen=recipes_seen,
+            special_recipes_learned=special_learned,
+            unmatched=unmatched,
+        )
 
     async def known_recipes_for_character(
         self,
@@ -4984,12 +5193,14 @@ class PanelMyCharsView(discord.ui.View):
     async def _load(self) -> None:
         self.claims = await self.cog.data.claims_for_user(self.owner_user_id)
         if self.claims:
-            if (
-                self.selected_claim is None
-                or self.selected_claim.character_key
-                not in {c.character_key for c in self.claims}
-            ):
-                self.selected_claim = self.claims[0]
+            # Always re-resolve to the freshly-fetched object by key, even
+            # when the previously-selected character is still present -
+            # otherwise a DB flag flipped via an action button (e.g. the
+            # crafting-notify toggle) would never show up after refresh()
+            # since the view kept pointing at the stale pre-flip object.
+            key = self.selected_claim.character_key if self.selected_claim else None
+            match = next((c for c in self.claims if c.character_key == key), None)
+            self.selected_claim = match or self.claims[0]
         else:
             self.selected_claim = None
 
@@ -5002,6 +5213,12 @@ class PanelMyCharsView(discord.ui.View):
         if self.selected_claim is not None:
             self.add_item(_MyCharsActionButton(self, "profession", "🛠️ Berufe pflegen"))
             self.add_item(_MyCharsActionButton(self, "recipes", "📖 Rezepte pflegen"))
+            notify_label = (
+                "🔕 Crafting-Anfragen aus"
+                if self.selected_claim.crafting_notify
+                else "🔔 Crafting-Anfragen an"
+            )
+            self.add_item(_MyCharsActionButton(self, "notify_toggle", notify_label))
             self.add_item(
                 _MyCharsActionButton(
                     self,
@@ -5046,6 +5263,11 @@ class PanelMyCharsView(discord.ui.View):
                 "✅ bestätigt"
                 if claim.status == "verified"
                 else "🕐 wartet auf Bestätigung"
+            )
+            lines.append(
+                "🔔 Crafting-Anfragen: An"
+                if claim.crafting_notify
+                else "🔕 Crafting-Anfragen: Aus"
             )
             gear = await self.cog.data.gear_snapshot(claim.character_key)
             if gear is not None:

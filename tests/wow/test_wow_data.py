@@ -304,6 +304,41 @@ async def test_claim_lifecycle_and_case_insensitive_lookup(tmp_path):
     await data.close()
 
 
+async def test_crafting_notify_defaults_on_and_can_be_toggled(tmp_path):
+    data = WoWData(str(tmp_path / "wow.db"))
+    member = roster_member()
+    await data.replace_snapshot([member])
+    claim, _ = await data.create_claim(member, 42)
+
+    # Default ON (opt-out), per the guild lead's decision - a fresh claim
+    # is pingable for crafting requests without any action needed.
+    assert claim.crafting_notify is True
+    assert (await data.get_claim(member.character_key)).crafting_notify is True
+
+    await data.set_crafting_notify(member.character_key, False)
+    assert (await data.get_claim(member.character_key)).crafting_notify is False
+
+    await data.set_crafting_notify(member.character_key, True)
+    assert (await data.get_claim(member.character_key)).crafting_notify is True
+    await data.close()
+
+
+async def test_crafting_notify_map_batches_multiple_keys_in_one_query(tmp_path):
+    data = WoWData(str(tmp_path / "wow.db"))
+    alpha = roster_member(name="Alpha", key="id:1")
+    beta = roster_member(name="Beta", key="id:2")
+    await data.replace_snapshot([alpha, beta])
+    await data.create_claim(alpha, 42)
+    await data.create_claim(beta, 43)
+    await data.set_crafting_notify("id:2", False)
+
+    result = await data.crafting_notify_map(["id:1", "id:2", "id:unknown"])
+
+    assert result == {"id:1": True, "id:2": False}
+    assert await data.crafting_notify_map([]) == {}
+    await data.close()
+
+
 async def test_claim_listing_and_review_message_lookup(tmp_path):
     data = WoWData(str(tmp_path / "wow.db"))
     member = roster_member()

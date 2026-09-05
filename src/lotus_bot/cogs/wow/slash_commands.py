@@ -1049,6 +1049,67 @@ async def crafting_recipes(
     )
 
 
+@crafting_group.command(
+    name="import",
+    description="Importiert Berufe/Rezepte aus dem LotusDiscordBridge-Addon-Code",
+)
+@app_commands.describe(
+    code="Export-Code aus dem Addon (/ldx im Spiel, Button 'Exportieren')"
+)
+async def crafting_import(interaction: discord.Interaction, code: str):
+    cog: WoWCog | None = interaction.client.get_cog("WoWCog")
+    if cog is None:
+        await interaction.response.send_message(
+            "WoW-System nicht verfuegbar.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    result = await cog.import_profession_export(
+        interaction.user.id, code, is_mod=_is_mod(interaction)
+    )
+
+    if result.status == "invalid":
+        await interaction.followup.send(
+            "Der Code konnte nicht gelesen werden - bitte frisch per `/ldx` im "
+            "Spiel exportieren und komplett kopieren.",
+            ephemeral=True,
+        )
+        return
+    if result.status == "not_claimed":
+        await interaction.followup.send(
+            f"**{result.character_name or '?'}** ist nicht geclaimed — erst "
+            "`/wow claim` benutzen.",
+            ephemeral=True,
+        )
+        return
+    if result.status == "forbidden":
+        await interaction.followup.send(
+            f"**{result.claim.character_name}** gehoert nicht dir.", ephemeral=True
+        )
+        return
+    if result.status == "no_professions":
+        await interaction.followup.send(
+            "Im Export waren keine Berufe enthalten.", ephemeral=True
+        )
+        return
+
+    lines = [
+        f"✅ **{result.character_name}**: {result.professions_imported} Beruf(e) "
+        f"aktualisiert, {result.recipes_seen} Rezepte geprueft."
+    ]
+    if result.special_recipes_learned:
+        lines.append(
+            f"🌟 {result.special_recipes_learned} davon neu als Spezialrezept gewertet."
+        )
+    if result.unmatched:
+        lines.append(
+            f"⚠️ {len(result.unmatched)} Rezept(e) nicht in unserer Datenbank "
+            "gefunden — siehe Bot-Logs fuer Details."
+        )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
 @crafting_group.command(name="learned", description="Zeigt gepflegte Spezialrezepte")
 @app_commands.describe(char="Name des geclaimten Charakters")
 @app_commands.autocomplete(char=claim_char_autocomplete)

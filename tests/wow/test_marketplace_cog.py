@@ -237,7 +237,9 @@ async def test_choose_character_for_listing_single_claim_shows_relation_label(
     interaction = make_interaction(99)
     await cog.choose_character_for_listing(interaction, "biete", "Ausruestung", "Test")
 
-    assert fake_forum.created[0]["content"].endswith("Angebot von Weedlager (Twink)")
+    assert fake_forum.created[0]["content"].endswith(
+        "Angebot von <@99> – Weedlager (Twink)"
+    )
     listing = await cog.data.get_listing(901)
     assert listing is not None
     assert listing.character_key == "id:3"
@@ -273,7 +275,7 @@ async def test_choose_character_for_listing_multiple_claims_shows_picker(tmp_pat
     await view.on_selected(picker_interaction, "id:2")
 
     assert fake_forum.created[0]["content"].endswith(
-        "Gesuch von Voidok (Twink von Lyxendra)"
+        "Gesuch von <@42> – Voidok (Twink von Lyxendra)"
     )
     await wow_data.close()
 
@@ -297,7 +299,53 @@ async def test_finish_crafting_request_stores_character_and_label(tmp_path):
 
     request = await cog.data.get_crafting_request(901)
     assert request.requester_character_key == "id:1"
-    assert "Gesucht von Lyxendra" in fake_forum.created[0]["content"]
+    assert "Gesucht von <@42> – Lyxendra" in fake_forum.created[0]["content"]
     assert "bringe Mats mit" in fake_forum.created[0]["content"]
     interaction.followup.send.assert_awaited_once()
+    await wow_data.close()
+
+
+async def test_finish_crafting_request_thread_title_names_the_profession(tmp_path):
+    """ "Schmied gesucht für Löwenherzhelm" beats a bare "X gesucht" - names
+    who the poster actually needs, not just what they need."""
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    main_char = roster_member("Lyxendra", "id:1", guild_rank=MEMBER_RANK)
+    await wow_data.replace_snapshot([main_char])
+    await wow_data.create_claim(main_char, 42)
+
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    fake_forum = FakeForum()
+    cog.forum = lambda: fake_forum
+
+    interaction = make_interaction(42)
+    result = make_result(item_name="Löwenherzhelm", status="no_crafter")
+    result.profession_id = "blacksmithing"
+    await cog._finish_crafting_request(
+        interaction, result, None, wow, "id:1", edit=False
+    )
+
+    assert fake_forum.created[0]["name"] == "🛠️ Schmied gesucht für Löwenherzhelm"
+    await wow_data.close()
+
+
+async def test_finish_crafting_request_falls_back_without_profession_id(tmp_path):
+    wow_data = WoWData(str(tmp_path / "wow.db"))
+    main_char = roster_member("Lyxendra", "id:1", guild_rank=MEMBER_RANK)
+    await wow_data.replace_snapshot([main_char])
+    await wow_data.create_claim(main_char, 42)
+
+    wow = make_real_wow(wow_data)
+    cog = await _make_cog(tmp_path, wow=wow)
+    fake_forum = FakeForum()
+    cog.forum = lambda: fake_forum
+
+    interaction = make_interaction(42)
+    result = make_result(item_name="Löwenherzhelm")  # profession_id=None by default
+
+    await cog._finish_crafting_request(
+        interaction, result, None, wow, "id:1", edit=False
+    )
+
+    assert fake_forum.created[0]["name"] == "🛠️ Löwenherzhelm gesucht"
     await wow_data.close()

@@ -1,5 +1,7 @@
 import base64
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import discord
@@ -87,6 +89,39 @@ class DummyBot:
 
     def get_cog(self, name):
         return None
+
+
+class DungeonsBot(DummyBot):
+    """Bot whose get_channel() serves the dungeons forum, and (once a guide
+    thread exists) that thread too — mirrors how publish_dungeons_guide looks
+    both up via plain bot.get_channel()."""
+
+    def __init__(self, forum=None, thread=None):
+        super().__init__()
+        self.forum = forum
+        self.thread = thread
+        self.fetch_channel = AsyncMock(return_value=None)
+
+    def get_channel(self, channel_id):
+        if channel_id == wow_cog_mod.DUNGEONS_FORUM_CHANNEL_ID:
+            return self.forum
+        if self.thread is not None and channel_id == self.thread.id:
+            return self.thread
+        return None
+
+
+def make_dungeons_forum(created_thread_id=4242):
+    """A ForumChannel fake whose create_thread() returns a Thread fake that
+    supports get_partial_message(...).edit(...) and edit(pinned=True)."""
+    forum = MagicMock(spec=discord.ForumChannel)
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = created_thread_id
+    thread.edit = AsyncMock()
+    partial_message = MagicMock()
+    partial_message.edit = AsyncMock()
+    thread.get_partial_message = MagicMock(return_value=partial_message)
+    forum.create_thread = AsyncMock(return_value=SimpleNamespace(thread=thread))
+    return forum, thread
 
 
 class DummyChampionCog:
@@ -365,6 +400,46 @@ async def test_panel_publish_updates_existing_message(tmp_path, patch_logged_tas
     # LayoutView; that's how Discord lets us upgrade a classic message.
     assert existing.edits[0]["content"] is None
     assert isinstance(existing.edits[0]["view"], wow_cog_mod.WoWPanelLayoutView)
+
+
+@pytest.mark.asyncio
+async def test_publish_dungeons_guide_creates_new_pinned_thread(
+    tmp_path, patch_logged_task
+):
+    forum, thread = make_dungeons_forum(created_thread_id=4242)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(DungeonsBot(forum=forum))
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+
+    await cog.publish_dungeons_guide()
+
+    forum.create_thread.assert_awaited_once()
+    _, kwargs = forum.create_thread.await_args
+    assert kwargs["content"] == wow_cog_mod.DUNGEONS_GUIDE_TEXT
+    assert await cog.data.get_setting("dungeons_guide_thread_id") == "4242"
+    thread.edit.assert_awaited_once_with(pinned=True)
+
+
+@pytest.mark.asyncio
+async def test_publish_dungeons_guide_edits_existing_thread(
+    tmp_path, patch_logged_task
+):
+    forum, thread = make_dungeons_forum(created_thread_id=5555)
+    patch_logged_task(wow_cog_mod, log_setup)
+    cog = WoWCog(DungeonsBot(forum=forum, thread=thread))
+    cog.data = WoWData(str(tmp_path / "wow.db"))
+    CREATED_COGS.append(cog)
+    await cog.data.set_setting("dungeons_guide_thread_id", "5555")
+
+    await cog.publish_dungeons_guide()
+
+    forum.create_thread.assert_not_awaited()
+    thread.get_partial_message.assert_called_once_with(5555)
+    thread.get_partial_message.return_value.edit.assert_awaited_once_with(
+        content=wow_cog_mod.DUNGEONS_GUIDE_TEXT
+    )
+    thread.edit.assert_awaited_once_with(pinned=True)
 
 
 @pytest.mark.asyncio
@@ -932,6 +1007,7 @@ async def test_my_chars_view_renders_claim_details(tmp_path, patch_logged_task):
     # global "claim new" button. Cooldown logging moved to the hub.
     labels = [c.label for c in view.children if isinstance(c, discord.ui.Button)]
     assert "🛠️ Berufe pflegen" in labels
+    assert "📥 Per Addon importieren" in labels
     assert "📖 Rezepte pflegen" in labels
     assert "🗑️ Claim freigeben" in labels
     assert "➕ Neuen Char claimen" in labels
@@ -1253,6 +1329,20 @@ async def test_character_display_label_officer_twink_not_treated_as_main(
     await cog.data.create_claim(bank, 42)
 
     assert await cog.character_display_label("id:2") == "Weedlager (Bank)"
+
+
+@pytest.mark.asyncio
+async def test_profession_practitioner_title_maps_known_professions(
+    tmp_path, patch_logged_task
+):
+    cog = await create_cog(tmp_path, patch_logged_task)
+
+    assert cog.profession_practitioner_title("blacksmithing") == "Schmied"
+    assert cog.profession_practitioner_title("enchanting") == "Verzauberer"
+    assert cog.profession_practitioner_title(None) is None
+    # No mapped title and no static record (empty test data) -> falls back
+    # to _profession_name, which itself falls back to the raw id.
+    assert cog.profession_practitioner_title("mining") == "mining"
 
 
 def test_crafting_search_response_view_maps_statuses():
@@ -2240,6 +2330,80 @@ async def test_import_profession_export_ownership_and_validation(
     # A moderator may import on behalf of someone else's character.
     as_mod = await cog.import_profession_export(999, code, is_mod=True)
     assert as_mod.status == "ok"
+
+
+def test_format_profession_import_result_covers_all_statuses():
+    cog = wow_cog_mod.WoWCog.__new__(wow_cog_mod.WoWCog)
+
+    invalid = wow_cog_mod.ProfessionImportResult("invalid")
+    assert "nicht gelesen werden" in cog.format_profession_import_result(invalid)
+
+    not_claimed = wow_cog_mod.ProfessionImportResult(
+        "not_claimed", character_name="Ghostface"
+    )
+    msg = cog.format_profession_import_result(not_claimed)
+    assert "Ghostface" in msg and "nicht geclaimed" in msg
+
+    claim = SimpleNamespace(character_name="Voidok")
+    forbidden = wow_cog_mod.ProfessionImportResult("forbidden", claim=claim)
+    assert "Voidok" in cog.format_profession_import_result(forbidden)
+    assert "gehört nicht dir" in cog.format_profession_import_result(forbidden)
+
+    no_professions = wow_cog_mod.ProfessionImportResult("no_professions")
+    assert "keine Berufe" in cog.format_profession_import_result(no_professions)
+
+    ok = wow_cog_mod.ProfessionImportResult(
+        "ok",
+        character_name="Voidok",
+        professions_imported=1,
+        recipes_seen=4,
+        special_recipes_learned=1,
+        unmatched=["alchemy: Foo"],
+    )
+    text = cog.format_profession_import_result(ok)
+    assert "1 Beruf(e)" in text
+    assert "🌟" in text and "1 davon" in text
+    assert "⚠️ 1 Rezept(e)" in text
+
+
+@pytest.mark.asyncio
+async def test_panel_addon_import_modal_reports_formatted_result(
+    tmp_path, patch_logged_task
+):
+    """End-to-end through the Panel's own modal (not the slash command) -
+    proves the wiring, not just import_profession_export() itself."""
+    cog = await create_cog(tmp_path, patch_logged_task)
+    cog.bot.data = {"wow": crafting_data()}
+    await cog.data.create_claim(member(name="Voidok"), 42)
+
+    profession = {"professionId": "alchemy", "skillLevel": 75, "recipes": []}
+    code = _build_addon_export("Voidok", [profession])
+
+    modal = wow_cog_mod.PanelAddonImportModal(cog)
+    modal.code._value = code
+    interaction = _DummyRaiderInteraction(_DummyLookupUser(42), guild=None)
+
+    await modal.on_submit(interaction)
+
+    assert interaction.response.deferred is True
+    content, kwargs = interaction.followup.messages[0]
+    assert "Voidok" in content and "1 Beruf(e)" in content
+    assert kwargs["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_my_chars_addon_import_opens_modal(tmp_path, patch_logged_task):
+    cog = await create_cog(tmp_path, patch_logged_task)
+    voidok = member(name="Voidok")
+    await cog.data.replace_snapshot([voidok])
+    await cog.data.create_claim(voidok, 42)
+    view = wow_cog_mod.PanelMyCharsView(cog, owner_user_id=42)
+    interaction = DummyReviewInteraction(DummyUser(42))
+    await view.send(interaction)
+
+    await cog._my_chars_addon_import(interaction, view)
+
+    assert isinstance(interaction.response.modals[0], wow_cog_mod.PanelAddonImportModal)
 
 
 @pytest.mark.asyncio

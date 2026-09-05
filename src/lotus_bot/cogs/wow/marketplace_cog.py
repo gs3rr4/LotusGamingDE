@@ -56,28 +56,28 @@ PING_COOLDOWN_MINUTES = 30
 
 HUB_TEXT = (
     "# 🛒 Marktplatz\n"
-    "Biete oder suche alles Mögliche — Items, Services, Portale, was auch "
-    "immer. Für Crafting-Gesuche gibt's extra Unterstützung: der Bot sucht "
-    "automatisch passende Crafter in der Gilde und pingt sie direkt hier "
-    "im Thread.\n\n"
+    "Biete oder suche Ausrüstung, Reagenzien, Dienstleistungen — was auch "
+    "immer. Für Crafting-Gesuche (Items **und** Verzauberungen) gibt's "
+    "extra Unterstützung: der Bot sucht automatisch passende Crafter in der "
+    "Gilde und pingt sie direkt hier im Thread.\n\n"
     "**So geht's:**\n"
-    "1. **🛠️ Crafting-Gesuch erstellen** — Item eingeben, der Bot findet "
-    "passende Crafter und pingt sie.\n"
-    "2. **📝 Sonstiges anbieten/suchen** — für alles andere: Items, "
-    "Services, Portale ...\n\n"
+    "1. **🛠️ Crafting-Gesuch erstellen** — Item oder Verzauberung eingeben, "
+    "der Bot findet passende Crafter und pingt sie.\n"
+    "2. **📝 Sonstiges anbieten/suchen** — für alles andere.\n\n"
     "Nur für Black-Lotus-Member. 🪷"
 )
 HUB_HELP_TEXT = (
     "**❓ Hilfe – Marktplatz**\n\n"
-    "**🛠️ Crafting-Gesuch erstellen** — gib das Item ein, das du brauchst. "
-    "Der Bot sucht in der Gilde nach bekannten Craftern (Beruf + Skill oder "
+    "**🛠️ Crafting-Gesuch erstellen** — gib das Item oder die Verzauberung "
+    'ein, die du brauchst (z.B. "Wuttrank" oder "Kreuzritter"). Der Bot '
+    "sucht in der Gilde nach bekannten Craftern (Beruf + Skill oder "
     "gepflegtes Spezialrezept) und pingt sie automatisch im neuen Thread. "
     "Auch ohne bekannten Crafter wird der Thread erstellt — vielleicht "
     "meldet sich trotzdem wer. Wer zuerst auf **✅ Ich übernehme das** "
     "klickt, hat die Anfrage übernommen.\n\n"
     "**📝 Sonstiges anbieten/suchen** — für alles, was kein Crafting ist: "
-    "Items, Services, Portale ... Titel + kurze Beschreibung, fertig. "
-    "**✅ Als erledigt markieren** schließt deinen Post wieder.\n\n"
+    "Titel + kurze Beschreibung, fertig. **✅ Als erledigt markieren** "
+    "schließt deinen Post wieder.\n\n"
     "Deine eigene Pingbarkeit für Crafting-Anfragen kannst du im "
     "🪷-Panel unter **Deine Chars** je Char an-/ausschalten."
 )
@@ -292,7 +292,7 @@ class MarketplaceCog(ManagedTaskCog):
         thread_name = (prefix + title.strip())[:100]
         kind_label = "Angebot" if kind == "biete" else "Gesuch"
         body_lines = [description.strip()] if description.strip() else []
-        body_lines.append(f"\n{kind_label} von {label}")
+        body_lines.append(f"\n{kind_label} von <@{interaction.user.id}> – {label}")
         tag_name = TAG_BIETE if kind == "biete" else TAG_SUCHE
 
         if edit:
@@ -521,11 +521,16 @@ class MarketplaceCog(ManagedTaskCog):
         item_name = wow._localized_text((result.item or {}).get("name")) or "?"
         item_key = self._item_key_for_result(result)
         label = await wow.character_display_label(character_key)
-        thread_name = f"🛠️ {item_name} gesucht"[:100]
+        practitioner = wow.profession_practitioner_title(result.profession_id)
+        thread_name = (
+            f"🛠️ {practitioner} gesucht für {item_name}"
+            if practitioner
+            else f"🛠️ {item_name} gesucht"
+        )[:100]
         body_lines = [f"**Item:** {item_name}"]
         if note:
             body_lines.append(f"**Notiz:** {note}")
-        body_lines.append(f"\nGesucht von {label}")
+        body_lines.append(f"\nGesucht von <@{interaction.user.id}> – {label}")
 
         created = await forum.create_thread(
             name=thread_name,
@@ -787,8 +792,8 @@ class MarketplaceCraftingItemModal(discord.ui.Modal):
         super().__init__(title="Crafting-Gesuch erstellen")
         self.cog = cog
         self.item = discord.ui.TextInput(
-            label="Welches Item brauchst du?",
-            placeholder="z. B. Wuttrank, Kreuzritter-Verzauberung ...",
+            label="Item oder Verzauberung?",
+            placeholder="z. B. Wuttrank, Kreuzritter ...",
             min_length=2,
             max_length=80,
         )

@@ -50,6 +50,29 @@ DEFAULT_POLL_INTERVAL = 3 * 60 * 60
 DEFAULT_CLAIM_REVIEW_CHANNEL_ID = 1544601948169314324
 DEFAULT_PANEL_CHANNEL_ID = 1463577361562992807
 DEFAULT_DIGEST_HOUR = 9
+# Forum channel where Raid-Helper posts dungeon-run events. Raid-Helper is a
+# THIRD-PARTY bot — we can't drive its /create flow ourselves, so this bot
+# only maintains a pinned, purely informational how-to post here (see
+# DUNGEONS_GUIDE_TEXT / publish_dungeons_guide).
+DUNGEONS_FORUM_CHANNEL_ID = 1214627449804165170
+DUNGEONS_GUIDE_TEXT = (
+    "# ⚔️ Dungeon-Run erstellen\n"
+    "Dungeon-Runs laufen über den **Raid-Helper**-Bot, nicht über diesen "
+    "Bot hier — die Terminfindung ist bei Raid-Helper schon eingebaut. "
+    "So geht's:\n\n"
+    "**1.** Tippe `/create` in <#1521609258066641037> (wow-general) oder "
+    "<#1152491425422901248> (wow-black-lotus). Achte auf das **Raid-Helper**"
+    "-Icon — mehrere Bots haben ähnliche `/create`-Befehle.\n\n"
+    "**2.** Raid-Helper fragt dich Schritt für Schritt nach Titel, "
+    "Beschreibung, Forum (wähle **wow-dungeons**) und Zeitpunkt "
+    "(z.B. `Heute 19:00`).\n\n"
+    "**⚠️ Wichtig, das übersehen viele:** Bei jeder dieser Fragen ganz "
+    "normal **im Chat antworten** (tippen + abschicken) — **nicht** "
+    "anklicken. Nur im **allerletzten** Schritt (die Übersicht mit der "
+    "Nummernliste) klickst du auf **Finish**, um den Run wirklich zu "
+    "erstellen.\n\n"
+    "Danach landet dein Run automatisch hier in **wow-dungeons**. 🪷"
+)
 # Guild role the bot fully owns: granted to every member with at least one
 # verified char claim, stripped from everyone else. Reconciled hourly plus
 # on each claim verify/release so it always mirrors the claim table.
@@ -152,6 +175,22 @@ COOLDOWN_SPELL_TO_GROUP: dict[str, tuple[str, dict]] = {
 MAX_PRIMARY_PROFESSIONS = 2
 SECONDARY_CRAFTING_PROFESSIONS = {"cooking"}
 EXCLUDED_CRAFTING_PROFESSIONS = {"first-aid", "fishing"}
+# The practitioner noun for a profession ("Schmied"), distinct from the
+# skill's own name ("Schmiedekunst", returned by _profession_name — that one
+# comes from the live Blizzard-API static data). Used e.g. in the
+# Marketplace's Crafting-Gesuch thread titles ("Schmied gesucht für X").
+# Classic doesn't track which armor/weapon specialization a recipe needs, so
+# this deliberately stays generic (no "Rüstungsschmied" vs. "Waffenschmied").
+PROFESSION_PRACTITIONER_TITLES = {
+    "blacksmithing": "Schmied",
+    "leatherworking": "Lederer",
+    "tailoring": "Schneider",
+    "engineering": "Ingenieur",
+    "alchemy": "Alchemist",
+    "enchanting": "Verzauberer",
+    "cooking": "Koch",
+    "jewelcrafting": "Juwelier",
+}
 EPIC_RECIPE_SPELL_IDS = {
     "spell.22749",  # Enchant Weapon - Spell Power
     "spell.22750",  # Enchant Weapon - Healing Power
@@ -426,6 +465,7 @@ class WoWCog(ManagedTaskCog):
     async def _poll_loop(self) -> None:
         await self.bot.wait_until_ready()
         await self._auto_publish_panel()
+        await self._auto_publish_dungeons_guide()
         while True:
             try:
                 if await self._scheduled_digest_due():
@@ -665,6 +705,62 @@ class WoWCog(ManagedTaskCog):
             )
         except Exception as exc:
             logger.error("[WoWCog] Auto-Publish fehlgeschlagen: %s", exc, exc_info=True)
+
+    async def publish_dungeons_guide(self) -> None:
+        """Create or refresh the pinned how-to post in the dungeons forum.
+
+        Purely informational (see ``DUNGEONS_GUIDE_TEXT``) — no tags, no
+        buttons, nothing interactive, since the actual event creation
+        happens entirely inside the third-party Raid-Helper bot. Mirrors
+        Duo's/Marketplace's "edit the tracked post in place, else create a
+        new one" hub pattern, using WoWData's generic settings store since
+        this is a single string, not worth a dedicated table.
+        """
+        channel = self.bot.get_channel(DUNGEONS_FORUM_CHANNEL_ID)
+        if not isinstance(channel, discord.ForumChannel):
+            logger.warning(
+                "[WoWCog] Dungeons-Forum %s nicht gefunden.",
+                DUNGEONS_FORUM_CHANNEL_ID,
+            )
+            return
+        guide_id = await self.data.get_setting("dungeons_guide_thread_id")
+        if guide_id:
+            try:
+                thread = self.bot.get_channel(
+                    int(guide_id)
+                ) or await self.bot.fetch_channel(int(guide_id))
+                if isinstance(thread, discord.Thread):
+                    await thread.get_partial_message(int(guide_id)).edit(
+                        content=DUNGEONS_GUIDE_TEXT
+                    )
+                    await self._try_pin_thread(thread)
+                    return
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.info(
+                    "[WoWCog] Bestehende Dungeons-Anleitung nicht editierbar — neu."
+                )
+        created = await channel.create_thread(
+            name="⚔️ Dungeon-Run erstellen – Anleitung", content=DUNGEONS_GUIDE_TEXT
+        )
+        await self.data.set_setting("dungeons_guide_thread_id", str(created.thread.id))
+        await self._try_pin_thread(created.thread)
+
+    async def _try_pin_thread(self, thread: discord.Thread) -> None:
+        try:
+            await thread.edit(pinned=True)
+        except (discord.Forbidden, discord.HTTPException, TypeError):
+            pass
+
+    async def _auto_publish_dungeons_guide(self) -> None:
+        try:
+            await self.publish_dungeons_guide()
+            logger.info("[WoWCog] Dungeons-Anleitung beim Start veröffentlicht.")
+        except Exception as exc:
+            logger.error(
+                "[WoWCog] Dungeons-Anleitung-Publish fehlgeschlagen: %s",
+                exc,
+                exc_info=True,
+            )
 
     async def set_announcement_channel(self, channel_id: int) -> None:
         await self.data.set_setting("announcement_channel_id", str(channel_id))
@@ -2320,6 +2416,11 @@ class WoWCog(ManagedTaskCog):
         # Direct text-modal: a 25-char dropdown was useless for larger guilds.
         await interaction.response.send_modal(PanelCharacterSearchModal(self))
 
+    async def _my_chars_addon_import(
+        self, interaction: discord.Interaction, view: "PanelMyCharsView"
+    ) -> None:
+        await interaction.response.send_modal(PanelAddonImportModal(self))
+
     async def build_whois_view(
         self, char_name: str, viewer_id: int
     ) -> "discord.ui.LayoutView | None":
@@ -2563,6 +2664,19 @@ class WoWCog(ManagedTaskCog):
     def _profession_name(self, profession_id: str, language: str = "de") -> str:
         profession = self._get_static_record("professions", profession_id)
         return self._localized_text(profession.get("name"), language) or profession_id
+
+    def profession_practitioner_title(self, profession_id: str | None) -> str | None:
+        """The "who does this" noun for a profession — see PROFESSION_PRACTITIONER_TITLES.
+
+        Falls back to the profession's own skill name if it's not one of the
+        mapped Classic crafting professions; ``None`` only when no
+        profession_id was given at all.
+        """
+        if not profession_id:
+            return None
+        return PROFESSION_PRACTITIONER_TITLES.get(
+            profession_id
+        ) or self._profession_name(profession_id)
 
     def normalize_recipe_language(self, language: str | None) -> str:
         if language in {"de", "en"}:
@@ -3208,6 +3322,42 @@ class WoWCog(ManagedTaskCog):
             special_recipes_learned=special_learned,
             unmatched=unmatched,
         )
+
+    def format_profession_import_result(self, result: ProfessionImportResult) -> str:
+        """Renders a ``import_profession_export`` result as one chat message.
+
+        Shared by the ``/wow crafting import`` slash command and the Panel's
+        Addon-Import modal so both surfaces stay in sync automatically.
+        """
+        if result.status == "invalid":
+            return (
+                "Der Code konnte nicht gelesen werden - bitte frisch per `/ldx` "
+                "im Spiel exportieren und komplett kopieren."
+            )
+        if result.status == "not_claimed":
+            return (
+                f"**{result.character_name or '?'}** ist nicht geclaimed — erst "
+                "claimen (`/wow claim` oder **Neuen Char claimen** im Panel)."
+            )
+        if result.status == "forbidden":
+            return f"**{result.claim.character_name}** gehört nicht dir."
+        if result.status == "no_professions":
+            return "Im Export waren keine Berufe enthalten."
+
+        lines = [
+            f"✅ **{result.character_name}**: {result.professions_imported} Beruf(e) "
+            f"aktualisiert, {result.recipes_seen} Rezepte geprüft."
+        ]
+        if result.special_recipes_learned:
+            lines.append(
+                f"🌟 {result.special_recipes_learned} davon neu als Spezialrezept gewertet."
+            )
+        if result.unmatched:
+            lines.append(
+                f"⚠️ {len(result.unmatched)} Rezept(e) nicht in unserer Datenbank "
+                "gefunden — siehe Bot-Logs für Details."
+            )
+        return "\n".join(lines)
 
     async def known_recipes_for_character(
         self,
@@ -4313,6 +4463,40 @@ class PanelCraftingSearchModal(discord.ui.Modal):
             await interaction.response.send_message(content, ephemeral=True)
 
 
+class PanelAddonImportModal(discord.ui.Modal):
+    """Panel counterpart of ``/wow crafting import`` — same
+    ``import_profession_export`` call, just reachable without typing a
+    slash command. The target character comes from the export code itself
+    (not from any char currently selected in the Panel), so this works
+    regardless of which char is selected in "Deine Chars".
+
+    Discord caps a modal TextInput at 4000 characters; a very large export
+    (many professions/recipes) may not fit — the slash command allows up to
+    6000 and is the fallback for that case.
+    """
+
+    def __init__(self, cog: WoWCog) -> None:
+        super().__init__(title="Beruf per Addon importieren")
+        self.cog = cog
+        self.code = discord.ui.TextInput(
+            label="Export-Code",
+            placeholder="/ldx im Spiel, Button 'Exportieren', hier einfügen",
+            style=discord.TextStyle.paragraph,
+            min_length=10,
+            max_length=4000,
+        )
+        self.add_item(self.code)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        result = await self.cog.import_profession_export(
+            interaction.user.id, str(self.code.value).strip()
+        )
+        await interaction.followup.send(
+            self.cog.format_profession_import_result(result), ephemeral=True
+        )
+
+
 class PanelCooldownStartView(discord.ui.View):
     """Ephemeral picker for logging a craft-cooldown.
 
@@ -4417,7 +4601,9 @@ PANEL_HELP_TEXT = (
     "**Kurzanleitung**\n\n"
     "**👤 Deine Chars** — verbinde Black-Lotus-Charaktere mit deinem "
     "Discord-Account, pflege Berufe & Spezialrezepte, schau dir aktive "
-    "Cooldowns an und gib Claims frei.\n\n"
+    "Cooldowns an und gib Claims frei. **📥 Per Addon importieren** übernimmt "
+    "Beruf, Skill und Rezepte direkt aus dem `/ldx`-Export-Code des Addons — "
+    "Alternative zum manuellen Eintragen.\n\n"
     "**🔎 In der Gilde suchen** — finde, wer ein bestimmtes Item craften "
     "kann, oder schlag einen Char nach (Owner, Berufe, Status).\n\n"
     "**⏳ Cooldown loggen** — wenn du als Alchemist eine Transmute oder "
@@ -5301,6 +5487,9 @@ class PanelMyCharsView(discord.ui.View):
             self.add_item(self._char_select)
         if self.selected_claim is not None:
             self.add_item(_MyCharsActionButton(self, "profession", "🛠️ Berufe pflegen"))
+            self.add_item(
+                _MyCharsActionButton(self, "addon_import", "📥 Per Addon importieren")
+            )
             self.add_item(_MyCharsActionButton(self, "recipes", "📖 Rezepte pflegen"))
             notify_label = (
                 "🔕 Crafting-Anfragen aus"

@@ -55,23 +55,25 @@ DEFAULT_DIGEST_HOUR = 9
 # only maintains a pinned, purely informational how-to post here (see
 # DUNGEONS_GUIDE_TEXT / publish_dungeons_guide).
 DUNGEONS_FORUM_CHANNEL_ID = 1214627449804165170
+# Raid-Helper's bot user id (not the /create command's own id, used below —
+# those are two different Discord snowflakes), so we can @-mention it.
+RAID_HELPER_BOT_ID = 579155972115660803
+# Slash-command mention for Raid-Helper's own /create — a real </name:id>
+# mention (not backtick text) so it's directly clickable and unambiguous,
+# no need to tell people to look for the right bot icon anymore.
 DUNGEONS_GUIDE_TEXT = (
     "# ⚔️ Dungeon-Run erstellen\n"
-    "Dungeon-Runs laufen über den **Raid-Helper**-Bot, nicht über diesen "
-    "Bot hier — die Terminfindung ist bei Raid-Helper schon eingebaut. "
-    "So geht's:\n\n"
-    "**1.** Tippe `/create` in <#1521609258066641037> (wow-general) oder "
-    "<#1152491425422901248> (wow-black-lotus). Achte auf das **Raid-Helper**"
-    "-Icon — mehrere Bots haben ähnliche `/create`-Befehle.\n\n"
-    "**2.** Raid-Helper fragt dich Schritt für Schritt nach Titel, "
-    "Beschreibung, Forum (wähle **wow-dungeons**) und Zeitpunkt "
-    "(z.B. `Heute 19:00`).\n\n"
+    "**1.** Klicke auf </create:885023455739777079> in "
+    "<#1521609258066641037> oder <#1152491425422901248>.\n\n"
+    f"**2.** <@{RAID_HELPER_BOT_ID}> fragt dich Schritt für Schritt nach Titel, "
+    "Beschreibung, Forum (wähle <#1214627449804165170>) und Zeitpunkt "
+    "(z. B. `Heute 19:00`).\n\n"
     "**⚠️ Wichtig, das übersehen viele:** Bei jeder dieser Fragen ganz "
     "normal **im Chat antworten** (tippen + abschicken) — **nicht** "
     "anklicken. Nur im **allerletzten** Schritt (die Übersicht mit der "
     "Nummernliste) klickst du auf **Finish**, um den Run wirklich zu "
     "erstellen.\n\n"
-    "Danach landet dein Run automatisch hier in **wow-dungeons**. 🪷"
+    "Danach landet dein Run automatisch hier in <#1214627449804165170>. 🪷"
 )
 # Guild role the bot fully owns: granted to every member with at least one
 # verified char claim, stripped from everyone else. Reconciled hourly plus
